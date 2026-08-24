@@ -49,30 +49,28 @@ Files involved:
 ## Task
 [Clear description of what to do next based on user's goal]`;
 
-const HANDOFF_INSTRUCTIONS = [
-	"Please generate a focused handoff prompt for a new session based on our conversation.",
-	"The prompt should:",
-	"1. Summarize relevant context (decisions made, approaches taken, key findings)",
-	"2. List any relevant files that were discussed or modified",
-	"3. Clearly state the next task based on my goal",
-	"4. Be self-contained so the new thread can proceed without this conversation",
-	"",
-	"Format as a prompt ready to send. Be concise but include all necessary context.",
-	'Do not include any preamble like "Here is the prompt" - just output the prompt itself.',
-	"",
-	"Example output format:",
-	"## Context",
-	"We have been working on X. Key decisions:",
-	"- Decision 1",
-	"- Decision 2",
-	"",
-	"Files involved:",
-	"- path/to/file1.ts",
-	"- path/to/file2.ts",
-	"",
-	"## Task",
-	"[Clear description of what to do next]",
-].join("\n");
+const HANDOFF_INSTRUCTIONS = `Please generate a focused handoff prompt for a new session based on our conversation.
+The prompt should:
+1. Summarize relevant context (decisions made, approaches taken, key findings)
+2. List any relevant files that were discussed or modified
+3. Clearly state the next task based on my goal
+4. Be self-contained so the new thread can proceed without this conversation
+
+Format as a prompt ready to send. Be concise but include all necessary context.
+Do not include any preamble like "Here is the prompt" - just output the prompt itself.
+
+Example output format:
+## Context
+We have been working on X. Key decisions:
+- Decision 1
+- Decision 2
+
+Files involved:
+- path/to/file1.ts
+- path/to/file2.ts
+
+## Task
+[Clear description of what to do next]`;
 
 function entryToMessage(entry: SessionEntry): AgentMessage | undefined {
 	if (entry.type === "message") {
