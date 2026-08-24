@@ -1,10 +1,33 @@
-# pi-llama-swap-provider
+# pi-extensions
 
-A [pi](https://github.com/earendil-works/pi) package that registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider.
+A collection of [pi](https://github.com/earendil-works/pi) extensions.
+
+| Extension | Description |
+| --- | --- |
+| [llama-swap provider](#llama-swap-provider) | Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider with model auto-discovery |
+| [handoff](#handoff) | Transfers context to a new focused session instead of a lossy compaction (full or compacted mode) |
+
+## Installation
+
+Install the full collection via `pi install`:
+
+```bash
+pi install git:github.com/tdamir/pi-extensions
+```
+
+To try it without installing, use the `--extension` flag:
+
+```bash
+pi --extension git:github.com/tdamir/pi-extensions
+```
+
+## llama-swap provider
+
+Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider.
 
 It dynamically discovers available models from your local llama-swap instance at startup and makes them available to the pi coding agent.
 
-## Features
+### Features
 
 - **Auto-discovery** — Fetches the full model list from llama-swap's `/models` API on load
 - **OpenAI-compatible** — Uses the `openai-completions` API format, so it works with any OpenAI-style client
@@ -14,30 +37,18 @@ It dynamically discovers available models from your local llama-swap instance at
 - **Configurable URL** — Set your llama-swap server address via settings or the `/llama-swap-url` command
 - **Hot-reload** — Changes apply automatically on `/reload`
 
-## Prerequisites
+### Prerequisites
 
 - [pi](https://github.com/earendil-works/pi) installed
 - [llama-swap](https://github.com/mostlygeek/llama-swap) running on your network
 
-## Installation
+### Configuration
 
-Install via `pi install`:
+#### Setting the llama-swap URL (required)
 
-```bash
-pi install git:github.com/tdamir/pi-llama-swap-provider
-```
+The provider **requires** a configured base URL. If `llamaSwap.baseUrl` is not set, the provider is not registered (you'll see a notice in the console at startup).
 
-To try it without installing, use the `--extension` flag:
-
-```bash
-pi --extension git:github.com/tdamir/pi-llama-swap-provider
-```
-
-## Configuration
-
-### Setting the llama-swap URL
-
-By default, the provider connects to `http://localhost:9292/v1`. To change it:
+To set it:
 
 1. Run the interactive command:
    ```
@@ -56,17 +67,17 @@ By default, the provider connects to `http://localhost:9292/v1`. To change it:
 
 The provider will automatically append `/v1` to the base URL.
 
-### Project-scoped configuration
+#### Project-scoped configuration
 
 Use `-l` with `pi install` to write to `.pi/settings.json` (project scope) instead:
 
 ```bash
-pi install -l git:github.com/tdamir/pi-llama-swap-provider
+pi install -l git:github.com/tdamir/pi-extensions
 ```
 
 This is useful for sharing configuration with your team.
 
-## Token & performance stats
+### Token & performance stats
 
 For every llama-swap turn, the provider captures llama.cpp's raw `usage` and `timings` SSE fields and stores them as `llama-swap-usage` entries in the session record, placed directly below the corresponding assistant message.
 
@@ -83,7 +94,7 @@ In the TUI, each entry renders as a dimmed one-liner, e.g.:
 
 Press the expand key on the entry to see the full raw `usage`/`timings` JSON. Captured records also persist in the session file, so the stats survive across sessions.
 
-## llama-swap model configuration
+### llama-swap model configuration
 
 This provider relies on llama-swap's `capabilities` section in `config.yaml` to report model metadata such as context length, input modalities, and tool support. Make sure your llama-swap config defines `capabilities` for each model so that information like context window size is properly handled:
 
@@ -101,13 +112,40 @@ models:
 
 See the [llama-swap config example](https://github.com/mostlygeek/llama-swap/blob/main/config.example.yaml) for the full list of available capabilities.
 
-### Reasoning-effort model variants
+#### Reasoning-effort model variants
 
 If llama-swap exposes fixed-effort model variants with a `:{level}` suffix (`off`, `low`, `medium`, or `xhigh`, e.g. `qwen3-coder:medium`), the provider pins each variant to its matching thinking level and hides the others, so you can switch effort by switching models.
 
-## Usage
+### Usage
 
 After installation and a `/reload`, models from your llama-swap instance will be available as the `llama-swap` provider in pi. Select it like any other provider when chatting with the agent.
+
+## handoff
+
+Transfers context from the current session to a new, focused session. Instead of compacting (which is lossy), handoff extracts what matters for your next task and creates a new session with a generated prompt.
+
+### Modes
+
+- **Compact (default):** `/handoff <goal>` sends the latest compaction summary plus the entries kept after compaction (if the session was compacted), with a dedicated summarizer system prompt. A much smaller context than the full session — cheaper to process.
+- **Full:** `/handoff full <goal>` (or `--full`) sends the entire session verbatim with the active system prompt and tools replicated, so it leverages provider-side prompt caching; subsequent calls benefit from cache hits on the shared conversation prefix. 
+
+### Usage
+
+```
+/handoff [full] <goal for new thread>
+```
+
+Examples:
+
+```
+/handoff now implement this for teams as well
+/handoff execute phase one of the plan
+/handoff full check other places that need this fix
+```
+
+The generated prompt appears as a draft in the editor so you can review or edit it before starting the new session. The new session tracks the current session as its parent.
+
+Requires interactive (TUI) mode.
 
 ## Development
 
@@ -115,8 +153,9 @@ After installation and a `/reload`, models from your llama-swap instance will be
 # Install dependencies
 npm install
 
-# Run locally without installing
-pi -e ./extensions/llama-swap-provider
+# Run a single extension locally without installing
+pi -e ./extensions/llama-swap.ts
+pi -e ./extensions/handoff.ts
 ```
 
 ## License

@@ -8,6 +8,7 @@
  * the session record.
  *
  * Server URL is configured in settings.json under `llamaSwap.baseUrl`.
+ * If no URL is configured, the provider is not registered.
  *
  * Usage:
  *   pi -e ./llama-swap
@@ -26,13 +27,12 @@ import { Box, Text } from "@earendil-works/pi-tui";
 // Configuration
 // =============================================================================
 
-const DEFAULT_BASE_URL = "http://localhost:9292/v1";
-
-function resolveBaseUrl(): string {
+/** Returns the configured llama-swap base URL, or undefined if not set. */
+function resolveBaseUrl(): string | undefined {
   try {
     const agentDir = getAgentDir();
     const settingsPath = join(agentDir, "settings.json");
-    if (!existsSync(settingsPath)) return DEFAULT_BASE_URL;
+    if (!existsSync(settingsPath)) return undefined;
 
     const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
     const url = raw.llamaSwap?.baseUrl as string | undefined;
@@ -44,7 +44,7 @@ function resolveBaseUrl(): string {
   } catch {
     // ignore
   }
-  return DEFAULT_BASE_URL;
+  return undefined;
 }
 
 function readSettings(): Record<string, unknown> {
@@ -302,7 +302,7 @@ function registerSetUrlCommand(pi: ExtensionAPI) {
   pi.registerCommand("llama-swap-url", {
     description: "Set the llama-swap provider base URL",
     handler: async (_args, ctx) => {
-      const current = resolveBaseUrl();
+      const current = resolveBaseUrl() ?? "(not set)";
       const prompt = `Current: ${current}\nEnter new base URL (without /v1, e.g. http://localhost:8080):`;
 
       const input = await ctx.ui.input(prompt);
@@ -326,6 +326,10 @@ export default async function (pi: ExtensionAPI) {
   registerSetUrlCommand(pi);
 
   const BASE_URL = resolveBaseUrl();
+  if (!BASE_URL) {
+    console.log("[llama-swap] No URL configured (llamaSwap.baseUrl in settings.json). Provider not registered.");
+    return;
+  }
 
   try {
     const response = await fetch(`${BASE_URL}/models`);

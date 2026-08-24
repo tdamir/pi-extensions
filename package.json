@@ -1,26 +1,28 @@
 {
-  "name": "pi-llama-swap-provider",
+  "name": "pi-extensions",
   "version": "1.0.0",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "llama-swap",
-    "llm-provider"
+    "llm-provider",
+    "handoff"
   ],
-  "description": "Registers llama-swap as an OpenAI-compatible LLM provider for pi - dynamically discovers models from your local llama-swap instance",
+  "description": "A collection of pi extensions: llama-swap LLM provider and handoff (transfer context to a new focused session)",
 
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tdamir/pi-llama-swap-provider.git"
+    "url": "https://github.com/tdamir/pi-extensions.git"
   },
   "author": "Damir Tesanovic",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/tdamir/pi-llama-swap-provider/issues"
+    "url": "https://github.com/tdamir/pi-extensions/issues"
   },
-  "homepage": "https://github.com/tdamir/pi-llama-swap-provider#readme",
+  "homepage": "https://github.com/tdamir/pi-extensions#readme",
   "pi": {
     "extensions": [
       "./extensions"
