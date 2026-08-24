@@ -91,7 +91,7 @@ type ThinkingLevel = (typeof THINKING_LEVELS)[number];
  * model ID (e.g. `qwen3-coder:medium`). The suffix must be kept in the ID
  * (the server needs it), and the thinking level is pinned to it.
  */
-const REASONING_SUFFIX_RE = /:(off|low|medium|xhigh)$/;
+const REASONING_SUFFIX_RE = /:(off|minimal|low|medium|high|xhigh|max)$/;
 
 function parseReasoningSuffix(id: string): ThinkingLevel | undefined {
   const match = REASONING_SUFFIX_RE.exec(id);
@@ -405,8 +405,11 @@ export default async function (pi: ExtensionAPI) {
       if (t?.prompt_per_second != null) parts.push(`prompt ${t.prompt_per_second.toFixed(0)} tok/s`);
       if (t?.predicted_per_second != null) parts.push(`gen ${t.predicted_per_second.toFixed(1)} tok/s`);
       if (t?.draft_n != null && t?.draft_n_accepted != null) {
-        parts.push(`draft ${t.draft_n_accepted}/${t.draft_n}`);
+        const pct = t.draft_n > 0 ? ((t.draft_n_accepted / t.draft_n) * 100).toFixed(0) : "0";
+        parts.push(`draft ${t.draft_n_accepted}/${t.draft_n} (${pct}%)`);
       }
+      const totalMs = (t?.prompt_ms ?? 0) + (t?.predicted_ms ?? 0);
+      if (totalMs > 0) parts.push(`${(totalMs / 1000).toFixed(1)}s`);
       const u = record.usage;
       if (u) {
         const cached = u.prompt_tokens_details?.cached_tokens
