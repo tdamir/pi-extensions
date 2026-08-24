@@ -35,6 +35,7 @@ It dynamically discovers available models from your local llama-swap instance at
 - **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
 - **Pinned reasoning effort** — Models with a `:{level}` suffix (e.g. `qwen3-coder:medium`) are pinned to that thinking level; all other levels are hidden for them
 - **Token & performance stats** — Taps the raw SSE stream to capture llama.cpp's `usage` and `timings` fields (dropped by the built-in parser) and shows them under each assistant message
+- **HTML export with stats** — `/export-with-stats` exports the session to HTML with the usage stats included (the built-in `/export` skips them)
 - **Configurable URL** — Set your llama-swap server address via settings or the `/llama-swap-url` command
 - **Hot-reload** — Changes apply automatically on `/reload`
 
@@ -94,6 +95,17 @@ In the TUI, each entry renders as a dimmed one-liner, e.g.:
 - **tokens** — prompt→completion tokens, with cached prompt tokens in parentheses
 
 Press the expand key on the entry to see the full raw `usage`/`timings` JSON. Captured records also persist in the session file, so the stats survive across sessions.
+
+### Exporting the session to HTML
+
+The built-in `/export` command skips `llama-swap-usage` entries, so the stats are missing from the exported HTML. Use `/export-with-stats` instead — it rewrites each usage entry as a visible hook message and runs the built-in HTML exporter:
+
+```
+/export-with-stats                  # export to pi-session-<name>.html in the current directory
+/export-with-stats path/to/out.html  # export to a specific file
+```
+
+Each turn's stats appear in the export as a one-liner under the corresponding assistant message, e.g. `⚡ llama-swap — prompt 420 tok/s · gen 28.4 tok/s · 512→384 tok`.
 
 ### llama-swap model configuration
 

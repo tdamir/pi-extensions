@@ -16,11 +16,13 @@
  * Or place in ~/.pi/agent/extensions/ for auto-discovery (hot-reloads on /reload).
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
+import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getApiProvider } from "@earendil-works/pi-ai";
+import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 // =============================================================================
@@ -295,6 +297,129 @@ function teedFetch(base: typeof globalThis.fetch): typeof globalThis.fetch {
 }
 
 // =============================================================================
+// HTML export with usage entries
+// =============================================================================
+
+/** One-line human-readable summary of a captured usage record. */
+function formatUsageSummary(record: LlamaSwapUsageRecord): string {
+  const parts: string[] = [];
+  const t = record.timings;
+  if (t?.prompt_per_second != null) parts.push(`prompt ${t.prompt_per_second.toFixed(0)} tok/s`);
+  if (t?.predicted_per_second != null) parts.push(`gen ${t.predicted_per_second.toFixed(1)} tok/s`);
+  if (t?.draft_n != null && t?.draft_n_accepted != null) {
+    const pct = t.draft_n > 0 ? ((t.draft_n_accepted / t.draft_n) * 100).toFixed(0) : "0";
+    parts.push(`draft ${t.draft_n_accepted}/${t.draft_n} (${pct}%)`);
+  }
+  const totalMs = (t?.prompt_ms ?? 0) + (t?.predicted_ms ?? 0);
+  if (totalMs > 0) parts.push(`${(totalMs / 1000).toFixed(1)}s`);
+  const u = record.usage;
+  if (u) {
+    const cached = u.prompt_tokens_details?.cached_tokens
+      ? ` (${u.prompt_tokens_details.cached_tokens} cached)`
+      : "";
+    parts.push(`${u.prompt_tokens ?? 0}\u2192${u.completion_tokens ?? 0} tok${cached}`);
+  }
+  return parts.length > 0 ? parts.join(" \u00B7 ") : "no usage data";
+}
+
+interface SessionEntryLike {
+  type?: string;
+  customType?: string;
+  id?: string;
+  parentId?: string;
+  timestamp?: string;
+  data?: unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * The built-in HTML exporter skips `custom` entries (from pi.appendEntry),
+ * so llama-swap-usage stats are invisible in /export output. Rewrite each
+ * usage entry as a `custom_message` entry (same id/parentId, so the tree
+ * structure is untouched). The exporter renders those as visible hook
+ * messages.
+ */
+function toExportableSessionLines(lines: string[]): string[] {
+  return lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return line;
+    let entry: SessionEntryLike;
+    try {
+      entry = JSON.parse(trimmed) as SessionEntryLike;
+    } catch {
+      return line;
+    }
+    if (entry.type !== "custom" || entry.customType !== "llama-swap-usage") return line;
+
+    const record = entry.data as LlamaSwapUsageRecord | undefined;
+    const exportable = {
+      type: "custom_message",
+      id: entry.id,
+      parentId: entry.parentId,
+      timestamp: entry.timestamp,
+      customType: "llama-swap-usage",
+      content: `\u26A1 llama-swap \u2014 ${record ? formatUsageSummary(record) : "no usage data"}`,
+      display: true,
+      details: record,
+    };
+    return JSON.stringify(exportable);
+  });
+}
+
+/** Locate and load the built-in standalone HTML exporter (not exported from the package root). */
+async function loadExportFromFile(): Promise<
+  (input: string, options?: { outputPath?: string }) => Promise<string>
+> {
+  const pkgDir = getPackageDir();
+  const candidates = [
+    join(pkgDir, "dist", "core", "export-html", "index.js"),
+    join(pkgDir, "src", "core", "export-html", "index.js"),
+    join(pkgDir, "core", "export-html", "index.js"),
+    join(pkgDir, "export-html", "index.js"),
+  ];
+  for (const candidate of candidates) {
+    if (!existsSync(candidate)) continue;
+    const mod = await import(pathToFileURL(candidate).href) as {
+      exportFromFile?: (input: string, options?: { outputPath?: string }) => Promise<string>;
+    };
+    if (typeof mod.exportFromFile === "function") return mod.exportFromFile;
+  }
+  throw new Error("Could not locate the pi HTML exporter (core/export-html/index.js)");
+}
+
+/** Command: /export-with-stats [file] — /export that includes llama-swap-usage entries. */
+function registerExportCommand(pi: ExtensionAPI) {
+  pi.registerCommand("export-with-stats", {
+    description: "Export session to HTML, including llama-swap usage stats",
+    handler: async (args, ctx) => {
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile || !existsSync(sessionFile)) {
+        ctx.ui.notify("No session file to export yet.", "error");
+        return;
+      }
+
+      const tmpFile = join(tmpdir(), `llama-swap-export-${process.pid}-${Date.now()}.jsonl`);
+      writeFileSync(tmpFile, toExportableSessionLines(readFileSync(sessionFile, "utf-8").split("\n")).join("\n"), "utf-8");
+
+      try {
+        const exportFromFile = await loadExportFromFile();
+        const outputPath = args.trim() || `pi-session-${basename(sessionFile, ".jsonl")}.html`;
+        const out = await exportFromFile(tmpFile, { outputPath });
+        ctx.ui.notify(`Exported to: ${out}`, "info");
+      } catch (error) {
+        ctx.ui.notify(`Export failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      } finally {
+        try {
+          unlinkSync(tmpFile);
+        } catch {
+          // ignore
+        }
+      }
+    },
+  });
+}
+
+// =============================================================================
 // Command: /llama-swap-url
 // =============================================================================
 
@@ -324,6 +449,7 @@ function registerSetUrlCommand(pi: ExtensionAPI) {
 
 export default async function (pi: ExtensionAPI) {
   registerSetUrlCommand(pi);
+  registerExportCommand(pi);
 
   const BASE_URL = resolveBaseUrl();
   if (!BASE_URL) {
@@ -400,26 +526,8 @@ export default async function (pi: ExtensionAPI) {
       const record = entry.data as LlamaSwapUsageRecord | undefined;
       if (!record) return undefined;
 
-      const parts: string[] = [];
-      const t = record.timings;
-      if (t?.prompt_per_second != null) parts.push(`prompt ${t.prompt_per_second.toFixed(0)} tok/s`);
-      if (t?.predicted_per_second != null) parts.push(`gen ${t.predicted_per_second.toFixed(1)} tok/s`);
-      if (t?.draft_n != null && t?.draft_n_accepted != null) {
-        const pct = t.draft_n > 0 ? ((t.draft_n_accepted / t.draft_n) * 100).toFixed(0) : "0";
-        parts.push(`draft ${t.draft_n_accepted}/${t.draft_n} (${pct}%)`);
-      }
-      const totalMs = (t?.prompt_ms ?? 0) + (t?.predicted_ms ?? 0);
-      if (totalMs > 0) parts.push(`${(totalMs / 1000).toFixed(1)}s`);
-      const u = record.usage;
-      if (u) {
-        const cached = u.prompt_tokens_details?.cached_tokens
-          ? ` (${u.prompt_tokens_details.cached_tokens} cached)`
-          : "";
-        parts.push(`${u.prompt_tokens ?? 0}\u2192${u.completion_tokens ?? 0} tok${cached}`);
-      }
-
       const box = new Box(0, 0);
-      box.addChild(new Text(theme.fg("dim", `\u26A1 llama-swap ${parts.join(" \u00B7 ")}`)));
+      box.addChild(new Text(theme.fg("dim", `\u26A1 llama-swap ${formatUsageSummary(record)}`)));
       if (expanded) {
         box.addChild(new Text(theme.fg("dim", JSON.stringify(record, null, 2))));
       }
