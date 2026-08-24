@@ -6,6 +6,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | --- | --- |
 | [llama-swap provider](#llama-swap-provider) | Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider with model auto-discovery |
 | [handoff](#handoff) | Transfers context to a new focused session instead of a lossy compaction (full or compacted mode) |
+| [session-name](#session-name) | Auto-generates a session name from the conversation (fresh excerpt or full cached session), or set it manually |
 
 ## Installation
 
@@ -147,6 +148,26 @@ The generated prompt appears as a draft in the editor so you can review or edit 
 
 Requires interactive (TUI) mode.
 
+## session-name
+
+Auto-generates a session name from the conversation context using the current model. The generated name is placed in the input as `/name <suggestion>` — press Enter to confirm or edit first.
+
+### Strategies
+
+- **Fresh (default):** `/session-name` sends only a short excerpt of the first user messages — a cheap, clean request with no cached prefix.
+- **Full:** `/session-name full` sends the entire session with the active system prompt and tools, so it leverages provider-side prompt caching; subsequent calls benefit from cache hits on the shared conversation prefix.
+
+### Usage
+
+```
+/session-name                # generate a name (fresh excerpt, default)
+/session-name full             # generate a name from the full session (cached prefix)
+/session-name "My Name"        # set the name manually
+/session-name show             # show the current session name
+```
+
+Requires interactive (TUI) mode.
+
 ## Development
 
 ```bash
@@ -156,6 +177,7 @@ npm install
 # Run a single extension locally without installing
 pi -e ./extensions/llama-swap.ts
 pi -e ./extensions/handoff.ts
+pi -e ./extensions/session-name.ts
 ```
 
 ## License
