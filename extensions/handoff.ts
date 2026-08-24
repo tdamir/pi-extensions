@@ -155,6 +155,18 @@ export default function (pi: ExtensionAPI) {
 			// Prepare the completion request for the requested mode (auth already verified)
 			let doGenerate: (signal: AbortSignal) => Promise<string | null>;
 
+			if (!ctx.model) {
+				ctx.ui.notify("No model selected", "error");
+				return;
+			}
+			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+			if (!auth.ok || !auth.apiKey) {
+				ctx.ui.notify(`Model error: ${auth.ok ? `No API key for ${ctx.model.provider}` : auth.error}`, "error");
+				return;
+			}
+
+			const model = ctx.model;
+
 			if (mode === "compact") {
 				// Gather conversation context from current branch. If the branch was compacted,
 				// include the compaction summary plus entries from firstKeptEntryId onward.
@@ -164,19 +176,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
-				if (!ctx.model) {
-					ctx.ui.notify("No model selected", "error");
-					return;
-				}
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-				if (!auth.ok || !auth.apiKey) {
-					ctx.ui.notify(`Model error: ${auth.ok ? `No API key for ${ctx.model.provider}` : auth.error}`, "error");
-					return;
-				}
-
 				// Convert to LLM format and serialize
 				const conversationText = serializeConversation(convertToLlm(messages));
-				const model = ctx.model;
 
 				doGenerate = async (signal) => {
 					const userMessage: Message = {
@@ -184,7 +185,7 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
-							text: `## Conversation History\n\n${conversationText}\n\n## User's Goal for New Thread\n\n${goal}`,
+								text: `## Conversation History\n\n${conversationText}\n\n## User's Goal for New Thread\n\n${goal}`,
 							},
 						],
 						timestamp: Date.now(),
@@ -217,22 +218,6 @@ export default function (pi: ExtensionAPI) {
 				const tools = allTools
 					.filter((t) => activeToolNames.includes(t.name))
 					.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
-
-				// Prefer the current model; fall back to a lightweight option
-				const model = ctx.model;
-				if (!model) {
-					ctx.ui.notify("No model available", "error");
-					return;
-				}
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-				if (!auth.ok) {
-					ctx.ui.notify(`Model error: ${auth.error}`, "error");
-					return;
-				}
-				if (!auth.apiKey) {
-					ctx.ui.notify(`No API key for ${model.provider}/${model.id}`, "error");
-					return;
-				}
 
 				doGenerate = async (signal) => {
 					const response = await completeCompat(
