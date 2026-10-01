@@ -3,9 +3,13 @@
  *
  * Registers llama-swap as an OpenAI-compatible provider.
  * Dynamically discovers models from the llama-swap API at startup.
- * Captures llama.cpp's raw `usage` and `timings` SSE fields (dropped by the
- * built-in parser) and stores them as `llama-swap-usage` custom entries in
- * the session record.
+ * Captures the raw SSE telemetry dropped by the built-in parser — llama.cpp's
+ * `usage` and `timings`, and vLLM's `usage` and `metrics` — and stores them as
+ * `llama-swap-usage` custom entries in the session record.
+ *
+ * /swap-stats toggles a panel with aggregate stats (token throughput, rates,
+ * draft acceptance) computed from the llama-swap-usage entries in the
+ * session log, so it works across reloads and resumed sessions.
  *
  * Server URL is configured in settings.json under `llamaSwap.baseUrl`.
  * If no URL is configured, the provider is not registered.
@@ -21,7 +25,7 @@ import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { getAgentDir, getPackageDir } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { CustomEntry, ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { Box, Text } from "@earendil-works/pi-tui";
 
@@ -168,7 +172,8 @@ interface LlamaUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
-  prompt_tokens_details?: { cached_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number; created_cache_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
   [key: string]: unknown;
 }
 
@@ -187,12 +192,32 @@ interface LlamaTimings {
   [key: string]: unknown;
 }
 
+/** vLLM's per-response `metrics` object (emitted on the final usage chunk). */
+interface LlamaMetrics {
+  time_to_first_token_ms?: number;
+  generation_time_ms?: number;
+  queue_time_ms?: number;
+  mean_itl_ms?: number;
+  tokens_per_second?: number;
+  speculative_decoding?: {
+    mean_acceptance_length?: number;
+    draft_acceptance_rate?: number;
+    acceptance_histogram?: number[];
+    num_spec_steps?: number;
+    num_accepted_draft_tokens?: number;
+    num_draft_tokens?: number;
+    num_spec_tokens?: number;
+  };
+  [key: string]: unknown;
+}
+
 interface LlamaSwapUsageRecord {
   responseId: string;
   model?: string;
   systemFingerprint?: string;
   usage?: LlamaUsage;
   timings?: LlamaTimings;
+  metrics?: LlamaMetrics;
   capturedAt: number;
 }
 
@@ -236,6 +261,7 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
         system_fingerprint?: string;
         usage?: LlamaUsage;
         timings?: LlamaTimings;
+        metrics?: LlamaMetrics;
       };
       try {
         chunk = JSON.parse(data);
@@ -249,6 +275,7 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
       }
       if (chunk.usage && typeof chunk.usage === "object") record.usage = chunk.usage;
       if (chunk.timings && typeof chunk.timings === "object") record.timings = chunk.timings;
+      if (chunk.metrics && typeof chunk.metrics === "object") record.metrics = chunk.metrics;
     };
 
     try {
@@ -271,7 +298,7 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
       } catch {
         // ignore
       }
-      if (record.responseId && (record.usage || record.timings)) {
+      if (record.responseId && (record.usage || record.timings || record.metrics)) {
         rememberCapture(record);
       }
     }
@@ -300,18 +327,80 @@ function teedFetch(base: typeof globalThis.fetch): typeof globalThis.fetch {
 // HTML export with usage entries
 // =============================================================================
 
+interface NormalizedTimings {
+  /** Prefill/prompt time in ms (llama.cpp prompt_ms, vLLM time_to_first_token_ms). */
+  promptMs: number;
+  /** Prompt tokens actually prefilled (llama.cpp prompt_n, vLLM prompt_tokens minus cached). */
+  promptN: number;
+  /** Generation time in ms (llama.cpp predicted_ms, vLLM generation_time_ms). */
+  predictedMs: number;
+  /** Generated tokens (llama.cpp predicted_n, vLLM completion_tokens). */
+  predictedN: number;
+  /** Total speculative draft tokens. */
+  draftN: number;
+  /** Accepted speculative draft tokens. */
+  draftAccepted: number;
+  /** Explicit prompt throughput if the server reported one. */
+  promptRate?: number;
+  /** Explicit generation throughput if the server reported one. */
+  genRate?: number;
+}
+
+/**
+ * Normalize llama.cpp `timings` and vLLM `metrics` into one shape so the
+ * summary line and aggregate stats work with either server.
+ */
+function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | undefined {
+  const t = record.timings;
+  if (t) {
+    return {
+      promptMs: t.prompt_ms ?? 0,
+      promptN: t.prompt_n ?? 0,
+      predictedMs: t.predicted_ms ?? 0,
+      predictedN: t.predicted_n ?? 0,
+      draftN: t.draft_n ?? 0,
+      draftAccepted: t.draft_n_accepted ?? 0,
+      ...(t.prompt_per_second != null ? { promptRate: t.prompt_per_second } : {}),
+      ...(t.predicted_per_second != null ? { genRate: t.predicted_per_second } : {}),
+    };
+  }
+
+  const m = record.metrics;
+  if (m) {
+    const u = record.usage;
+    const promptTokens = u?.prompt_tokens ?? 0;
+    const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+    const spec = m.speculative_decoding;
+    return {
+      promptMs: m.time_to_first_token_ms ?? 0,
+      promptN: Math.max(0, promptTokens - cached),
+      predictedMs: m.generation_time_ms ?? 0,
+      predictedN: u?.completion_tokens ?? 0,
+      draftN: spec?.num_draft_tokens ?? 0,
+      draftAccepted: spec?.num_accepted_draft_tokens ?? 0,
+      ...(m.tokens_per_second != null ? { genRate: m.tokens_per_second } : {}),
+    };
+  }
+
+  return undefined;
+}
+
 /** One-line human-readable summary of a captured usage record. */
 function formatUsageSummary(record: LlamaSwapUsageRecord): string {
   const parts: string[] = [];
-  const t = record.timings;
-  if (t?.prompt_per_second != null) parts.push(`prompt ${t.prompt_per_second.toFixed(0)} tok/s`);
-  if (t?.predicted_per_second != null) parts.push(`gen ${t.predicted_per_second.toFixed(1)} tok/s`);
-  if (t?.draft_n != null && t?.draft_n_accepted != null) {
-    const pct = t.draft_n > 0 ? ((t.draft_n_accepted / t.draft_n) * 100).toFixed(0) : "0";
-    parts.push(`draft ${t.draft_n_accepted}/${t.draft_n} (${pct}%)`);
+  const nt = normalizeTimings(record);
+  if (nt) {
+    const promptRate = nt.promptRate ?? (nt.promptMs > 0 && nt.promptN > 0 ? nt.promptN / (nt.promptMs / 1000) : undefined);
+    if (promptRate != null && Number.isFinite(promptRate)) parts.push(`prompt ${promptRate.toFixed(0)} tok/s`);
+    const genRate = nt.genRate ?? (nt.predictedMs > 0 && nt.predictedN > 0 ? nt.predictedN / (nt.predictedMs / 1000) : undefined);
+    if (genRate != null && Number.isFinite(genRate)) parts.push(`gen ${genRate.toFixed(1)} tok/s`);
+    if (nt.draftN > 0) {
+      const pct = ((nt.draftAccepted / nt.draftN) * 100).toFixed(0);
+      parts.push(`draft ${nt.draftAccepted}/${nt.draftN} (${pct}%)`);
+    }
+    const totalMs = nt.promptMs + nt.predictedMs;
+    if (totalMs > 0) parts.push(`${(totalMs / 1000).toFixed(1)}s`);
   }
-  const totalMs = (t?.prompt_ms ?? 0) + (t?.predicted_ms ?? 0);
-  if (totalMs > 0) parts.push(`${(totalMs / 1000).toFixed(1)}s`);
   const u = record.usage;
   if (u) {
     const cached = u.prompt_tokens_details?.cached_tokens
@@ -387,6 +476,172 @@ async function loadExportFromFile(): Promise<
   throw new Error("Could not locate the pi HTML exporter (core/export-html/index.js)");
 }
 
+// =============================================================================
+// Formatting helpers
+// =============================================================================
+
+/** Format milliseconds as `1h 02m 03s` or `2m 03s`. */
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
+  }
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+// =============================================================================
+// Command: /swap-stats — aggregate stats from llama-swap-usage session entries
+// =============================================================================
+
+interface SwapLogStats {
+  requests: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  promptMs: number;
+  predictedMs: number;
+  promptN: number;
+  predictedN: number;
+  draftN: number;
+  draftAccepted: number;
+  firstAt: number;
+  lastAt: number;
+}
+
+/**
+ * Compute aggregate stats from llama-swap-usage entries in the session log.
+ * Works across reloads and resumed sessions, since the data comes from the
+ * session record.
+ */
+function computeUsageStats(
+  entries: SessionEntry[],
+): { stats: SwapLogStats; records: { ts: number; record: LlamaSwapUsageRecord }[] } | undefined {
+  const records = entries
+    .filter((e): e is CustomEntry<LlamaSwapUsageRecord> => e.type === "custom" && e.customType === "llama-swap-usage")
+    .map((e) => ({
+      ts: Date.parse(e.timestamp),
+      record: e.data as LlamaSwapUsageRecord | undefined,
+    }))
+    .filter((e): e is { ts: number; record: LlamaSwapUsageRecord } => !!e.record);
+
+  if (records.length === 0) return undefined;
+
+  const stats: SwapLogStats = {
+    requests: records.length,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedTokens: 0,
+    promptMs: 0,
+    predictedMs: 0,
+    promptN: 0,
+    predictedN: 0,
+    draftN: 0,
+    draftAccepted: 0,
+    firstAt: Infinity,
+    lastAt: 0,
+  };
+
+  for (const { ts, record } of records) {
+    const at = Number.isFinite(ts) ? ts : record.capturedAt;
+    if (Number.isFinite(at)) {
+      stats.firstAt = Math.min(stats.firstAt, at);
+      stats.lastAt = Math.max(stats.lastAt, at);
+    }
+    const u = record.usage;
+    if (u) {
+      stats.promptTokens += u.prompt_tokens ?? 0;
+      stats.completionTokens += u.completion_tokens ?? 0;
+      stats.cachedTokens += u.prompt_tokens_details?.cached_tokens ?? 0;
+    }
+    const nt = normalizeTimings(record);
+    if (nt) {
+      stats.promptMs += nt.promptMs;
+      stats.predictedMs += nt.predictedMs;
+      stats.promptN += nt.promptN;
+      stats.predictedN += nt.predictedN;
+      stats.draftN += nt.draftN;
+      stats.draftAccepted += nt.draftAccepted;
+    }
+  }
+
+  return { stats, records };
+}
+
+/**
+ * Command: /swap-stats — toggles a panel above the editor with aggregate
+ * llama-swap stats computed from the session log (survives restarts/reloads).
+ */
+function registerSwapStatsCommand(pi: ExtensionAPI) {
+  let visible = false;
+  const WIDGET_KEY = "llama-swap-stats";
+  const hide = (ui: { setWidget: (key: string, content: string[] | undefined) => void }) => {
+    if (!visible) return;
+    visible = false;
+    ui.setWidget(WIDGET_KEY, undefined);
+  };
+
+  pi.on("session_shutdown", (_event, ctx) => hide(ctx.ui));
+
+  pi.registerCommand("swap-stats", {
+    description: "Show aggregate llama-swap stats from the session log (toggles the panel)",
+    handler: async (_args, ctx) => {
+      if (visible) {
+        hide(ctx.ui);
+        ctx.ui.notify("llama-swap stats panel hidden.", "info");
+        return;
+      }
+
+      const theme = ctx.ui.theme;
+      const dim = (text: string) => theme.fg("dim", text);
+      const row = (label: string, value: string) => `  ${dim(label.padEnd(10))} ${value}`;
+
+      const result = computeUsageStats(ctx.sessionManager.getEntries());
+
+      if (!result) {
+        ctx.ui.notify("No llama-swap usage entries in this session yet.", "info");
+        return;
+      }
+
+      const { stats, records } = result;
+      const tokS = (n: number, ms: number) => (ms > 0 ? (n / (ms / 1000)).toFixed(1) : undefined);
+
+      const lines: string[] = [];
+      lines.push(theme.bold("llama-swap stats (session log)"));
+      lines.push(row("Requests", String(stats.requests)));
+      if (Number.isFinite(stats.firstAt) && stats.lastAt > stats.firstAt) {
+        lines.push(row("Span", `${formatDuration(stats.lastAt - stats.firstAt)} (${new Date(stats.firstAt).toLocaleTimeString()} \u2192 ${new Date(stats.lastAt).toLocaleTimeString()})`));
+      }
+      if (stats.promptTokens > 0 || stats.completionTokens > 0) {
+        const cached = stats.cachedTokens > 0 ? dim(` (${stats.cachedTokens.toLocaleString()} cached)`) : "";
+        lines.push(row("Tokens", `${stats.promptTokens.toLocaleString()} in${cached} / ${stats.completionTokens.toLocaleString()} out`));
+      }
+      const promptRate = tokS(stats.promptN, stats.promptMs);
+      if (promptRate) lines.push(row("Prompt", `\u2248 ${promptRate} tok/s`));
+      const genRate = tokS(stats.predictedN, stats.predictedMs);
+      if (genRate) lines.push(row("Generation", `\u2248 ${genRate} tok/s`));
+      if (stats.draftN > 0) {
+        const pct = ((stats.draftAccepted / stats.draftN) * 100).toFixed(0);
+        lines.push(row("Draft", `${stats.draftAccepted}/${stats.draftN} accepted (${pct}%)`));
+      }
+      const wallMs = stats.predictedMs + stats.promptMs;
+      if (wallMs > 0) lines.push(row("LLM time", `${(wallMs / 1000).toFixed(1)}s total`));
+
+      // Most recent requests, newest first.
+      lines.push("");
+      lines.push(theme.bold("recent requests"));
+      for (const { ts, record } of records.slice(-5).reverse()) {
+        lines.push(row("", dim(Number.isFinite(ts) ? new Date(ts).toLocaleTimeString() : "\u2014") + `  ${formatUsageSummary(record)}`));
+      }
+
+      visible = true;
+      ctx.ui.setWidget(WIDGET_KEY, lines, { placement: "aboveEditor" });
+    },
+  });
+}
+
 /** Command: /export-with-stats [file] — /export that includes llama-swap-usage entries. */
 function registerExportCommand(pi: ExtensionAPI) {
   pi.registerCommand("export-with-stats", {
@@ -450,6 +705,7 @@ function registerSetUrlCommand(pi: ExtensionAPI) {
 export default async function (pi: ExtensionAPI) {
   registerSetUrlCommand(pi);
   registerExportCommand(pi);
+  registerSwapStatsCommand(pi);
 
   const BASE_URL = resolveBaseUrl();
   if (!BASE_URL) {
@@ -516,7 +772,7 @@ export default async function (pi: ExtensionAPI) {
       // The tap usually finishes with the stream; give it a moment to land.
       await Promise.race([capture.ready, new Promise((r) => setTimeout(r, 2000))]);
       const record = capture.record;
-      if (!record || (!record.usage && !record.timings)) return;
+      if (!record || (!record.usage && !record.timings && !record.metrics)) return;
 
       captures.delete(record.responseId);
       pi.appendEntry("llama-swap-usage", record);
