@@ -11,8 +11,15 @@
  * draft acceptance) computed from the llama-swap-usage entries in the
  * session log, so it works across reloads and resumed sessions.
  *
- * Server URL is configured in settings.json under `llamaSwap.baseUrl`.
- * If no URL is configured, the provider is not registered.
+ * Servers are configured in settings.json under `llamaSwap.servers`; each
+ * entry is registered as a provider named after the server:
+ *   - `servers.gx10: "http://gx10.local:9292"` → provider `gx10`
+ * If no servers are configured, no provider is registered.
+ *
+ * /llama-swap-url manages the configured servers:
+ *   /llama-swap-url                  — add a server (prompt for name and URL)
+ *   /llama-swap-url add <name> <url> — add a server
+ *   /llama-swap-url remove <name>    — remove a server
  *
  * Usage:
  *   pi -e ./llama-swap
@@ -33,24 +40,26 @@ import { Box, Text } from "@earendil-works/pi-tui";
 // Configuration
 // =============================================================================
 
-/** Returns the configured llama-swap base URL, or undefined if not set. */
-function resolveBaseUrl(): string | undefined {
-  try {
-    const agentDir = getAgentDir();
-    const settingsPath = join(agentDir, "settings.json");
-    if (!existsSync(settingsPath)) return undefined;
+interface SwapServer {
+  /** Name in `llamaSwap.servers`. */
+  name: string;
+  /** Normalized base URL (with trailing /v1). */
+  url: string;
+  /** pi provider id: the (sanitized) server name. */
+  providerId: string;
+}
 
-    const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
-    const url = raw.llamaSwap?.baseUrl as string | undefined;
-    if (url) {
-      // Normalize: ensure trailing /v1
-      const base = url.replace(/\/+$/, "");
-      return base.endsWith("/v1") ? base : `${base}/v1`;
-    }
-  } catch {
-    // ignore
+/** Read `llamaSwap.servers` from settings.json (empty object if absent). */
+function readLlamaSwapConfig(): { servers?: Record<string, unknown> } {
+  const raw = readSettings();
+  const config = (raw.llamaSwap as Record<string, unknown> | undefined) ?? {};
+  // One-time cleanup: drop the legacy `baseUrl` key (superseded by `servers`).
+  if (config.baseUrl !== undefined) {
+    delete config.baseUrl;
+    raw.llamaSwap = config;
+    writeSettings(raw);
   }
-  return undefined;
+  return { servers: config.servers as Record<string, unknown> | undefined };
 }
 
 function readSettings(): Record<string, unknown> {
@@ -71,12 +80,58 @@ function normalizeUrl(url: string): string {
   return base.endsWith("/v1") ? base : `${base}/v1`;
 }
 
-function setLlamaSwapUrl(url: string) {
+/**
+ * Collect all configured llama-swap servers. Each `llamaSwap.servers` entry
+ * becomes a provider named after the server. Duplicate URLs are registered
+ * only once (the first entry wins).
+ */
+function resolveServers(): SwapServer[] {
+  const { servers } = readLlamaSwapConfig();
+  const result: SwapServer[] = [];
+  const seen = new Set<string>();
+
+  const add = (name: string, url: string) => {
+    const normalized = normalizeUrl(url);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    const safeName = name.replace(/[^a-zA-Z0-9-]/g, "-");
+    result.push({
+      name,
+      url: normalized,
+      providerId: safeName,
+    });
+  };
+
+  for (const [name, value] of Object.entries(servers ?? {})) {
+    if (typeof value === "string" && value) add(name, value);
+  }
+  return result;
+}
+
+/** Add (or replace) a server in `llamaSwap.servers`. */
+function setServer(name: string, url: string): string {
   const raw = readSettings();
-  const normalized = normalizeUrl(url);
-  raw.llamaSwap = { baseUrl: normalized };
+  const config: Record<string, unknown> = (raw.llamaSwap as Record<string, unknown> | undefined) ?? {};
+  const servers = (config.servers as Record<string, string> | undefined) ?? {};
+  servers[name] = normalizeUrl(url);
+  config.servers = servers;
+  raw.llamaSwap = config;
   writeSettings(raw);
-  return normalized;
+  return servers[name];
+}
+
+/** Remove a server from `llamaSwap.servers`. Returns false if not found. */
+function removeServer(name: string): boolean {
+  const raw = readSettings();
+  const config = (raw.llamaSwap as Record<string, unknown> | undefined) ?? {};
+  const servers = (config.servers as Record<string, string> | undefined) ?? {};
+  if (!(name in servers)) return false;
+  delete servers[name];
+  if (Object.keys(servers).length > 0) config.servers = servers;
+  else delete config.servers;
+  raw.llamaSwap = config;
+  writeSettings(raw);
+  return true;
 }
 
 // =============================================================================
@@ -213,6 +268,8 @@ interface LlamaMetrics {
 
 interface LlamaSwapUsageRecord {
   responseId: string;
+  /** Provider (server) id that served the request. */
+  server?: string;
   model?: string;
   systemFingerprint?: string;
   usage?: LlamaUsage;
@@ -447,7 +504,7 @@ function toExportableSessionLines(lines: string[]): string[] {
       parentId: entry.parentId,
       timestamp: entry.timestamp,
       customType: "llama-swap-usage",
-      content: `\u26A1 llama-swap \u2014 ${record ? formatUsageSummary(record) : "no usage data"}`,
+      content: `\u26A1 llama-swap${record?.server ? ` [${record.server}]` : ""} \u2014 ${record ? formatUsageSummary(record) : "no usage data"}`,
       display: true,
       details: record,
     };
@@ -511,24 +568,27 @@ interface SwapLogStats {
   lastAt: number;
 }
 
+interface UsageRecordEntry {
+  ts: number;
+  record: LlamaSwapUsageRecord;
+}
+
 /**
- * Compute aggregate stats from llama-swap-usage entries in the session log.
- * Works across reloads and resumed sessions, since the data comes from the
- * session record.
+ * Collect llama-swap-usage records from the session log. Works across
+ * reloads and resumed sessions, since the data comes from the session record.
  */
-function computeUsageStats(
-  entries: SessionEntry[],
-): { stats: SwapLogStats; records: { ts: number; record: LlamaSwapUsageRecord }[] } | undefined {
-  const records = entries
+function collectUsageRecords(entries: SessionEntry[]): UsageRecordEntry[] {
+  return entries
     .filter((e): e is CustomEntry<LlamaSwapUsageRecord> => e.type === "custom" && e.customType === "llama-swap-usage")
     .map((e) => ({
       ts: Date.parse(e.timestamp),
       record: e.data as LlamaSwapUsageRecord | undefined,
     }))
-    .filter((e): e is { ts: number; record: LlamaSwapUsageRecord } => !!e.record);
+    .filter((e): e is UsageRecordEntry => !!e.record);
+}
 
-  if (records.length === 0) return undefined;
-
+/** Compute aggregate stats for one server's usage records. */
+function computeStats(records: UsageRecordEntry[]): SwapLogStats {
   const stats: SwapLogStats = {
     requests: records.length,
     promptTokens: 0,
@@ -567,7 +627,7 @@ function computeUsageStats(
     }
   }
 
-  return { stats, records };
+  return stats;
 }
 
 /**
@@ -598,42 +658,61 @@ function registerSwapStatsCommand(pi: ExtensionAPI) {
       const dim = (text: string) => theme.fg("dim", text);
       const row = (label: string, value: string) => `  ${dim(label.padEnd(10))} ${value}`;
 
-      const result = computeUsageStats(ctx.sessionManager.getEntries());
-
-      if (!result) {
+      const records = collectUsageRecords(ctx.sessionManager.getEntries());
+      if (records.length === 0) {
         ctx.ui.notify("No llama-swap usage entries in this session yet.", "info");
         return;
       }
 
-      const { stats, records } = result;
+      // Group by the provider (server) that served the request, preserving
+      // first-seen order.
+      const groups = new Map<string, UsageRecordEntry[]>();
+      for (const entry of records) {
+        const server = entry.record.server ?? "llama-swap";
+        const list = groups.get(server);
+        if (list) list.push(entry);
+        else groups.set(server, [entry]);
+      }
+      const multi = groups.size > 1;
+
       const tokS = (n: number, ms: number) => (ms > 0 ? (n / (ms / 1000)).toFixed(1) : undefined);
+      const pushServerRows = (stats: SwapLogStats) => {
+        lines.push(row("Requests", String(stats.requests)));
+        if (Number.isFinite(stats.firstAt) && stats.lastAt > stats.firstAt) {
+          lines.push(row("Span", `${formatDuration(stats.lastAt - stats.firstAt)} (${new Date(stats.firstAt).toLocaleTimeString()} \u2192 ${new Date(stats.lastAt).toLocaleTimeString()})`));
+        }
+        if (stats.promptTokens > 0 || stats.completionTokens > 0) {
+          const cached = stats.cachedTokens > 0 ? dim(` (${stats.cachedTokens.toLocaleString()} cached)`) : "";
+          lines.push(row("Tokens", `${stats.promptTokens.toLocaleString()} in${cached} / ${stats.completionTokens.toLocaleString()} out`));
+        }
+        const promptRate = tokS(stats.promptN, stats.promptMs);
+        if (promptRate) lines.push(row("Prompt", `\u2248 ${promptRate} tok/s`));
+        const genRate = tokS(stats.predictedN, stats.predictedMs);
+        if (genRate) lines.push(row("Generation", `\u2248 ${genRate} tok/s`));
+        if (stats.draftN > 0) {
+          const pct = ((stats.draftAccepted / stats.draftN) * 100).toFixed(0);
+          lines.push(row("Draft", `${stats.draftAccepted}/${stats.draftN} accepted (${pct}%)`));
+        }
+        const wallMs = stats.predictedMs + stats.promptMs;
+        if (wallMs > 0) lines.push(row("LLM time", `${(wallMs / 1000).toFixed(1)}s total`));
+      };
 
       const lines: string[] = [];
       lines.push(theme.bold("llama-swap stats (session log)"));
-      lines.push(row("Requests", String(stats.requests)));
-      if (Number.isFinite(stats.firstAt) && stats.lastAt > stats.firstAt) {
-        lines.push(row("Span", `${formatDuration(stats.lastAt - stats.firstAt)} (${new Date(stats.firstAt).toLocaleTimeString()} \u2192 ${new Date(stats.lastAt).toLocaleTimeString()})`));
+      for (const [server, serverRecords] of groups) {
+        if (multi) {
+          lines.push("");
+          lines.push(theme.bold(server));
+        }
+        pushServerRows(computeStats(serverRecords));
       }
-      if (stats.promptTokens > 0 || stats.completionTokens > 0) {
-        const cached = stats.cachedTokens > 0 ? dim(` (${stats.cachedTokens.toLocaleString()} cached)`) : "";
-        lines.push(row("Tokens", `${stats.promptTokens.toLocaleString()} in${cached} / ${stats.completionTokens.toLocaleString()} out`));
-      }
-      const promptRate = tokS(stats.promptN, stats.promptMs);
-      if (promptRate) lines.push(row("Prompt", `\u2248 ${promptRate} tok/s`));
-      const genRate = tokS(stats.predictedN, stats.predictedMs);
-      if (genRate) lines.push(row("Generation", `\u2248 ${genRate} tok/s`));
-      if (stats.draftN > 0) {
-        const pct = ((stats.draftAccepted / stats.draftN) * 100).toFixed(0);
-        lines.push(row("Draft", `${stats.draftAccepted}/${stats.draftN} accepted (${pct}%)`));
-      }
-      const wallMs = stats.predictedMs + stats.promptMs;
-      if (wallMs > 0) lines.push(row("LLM time", `${(wallMs / 1000).toFixed(1)}s total`));
 
       // Most recent requests, newest first.
       lines.push("");
       lines.push(theme.bold("recent requests"));
       for (const { ts, record } of records.slice(-5).reverse()) {
-        lines.push(row("", dim(Number.isFinite(ts) ? new Date(ts).toLocaleTimeString() : "\u2014") + `  ${formatUsageSummary(record)}`));
+        const tag = multi ? ` [${record.server ?? "llama-swap"}]` : "";
+        lines.push(row("", dim(Number.isFinite(ts) ? new Date(ts).toLocaleTimeString() : "\u2014") + tag + `  ${formatUsageSummary(record)}`));
       }
 
       visible = true;
@@ -680,19 +759,48 @@ function registerExportCommand(pi: ExtensionAPI) {
 
 function registerSetUrlCommand(pi: ExtensionAPI) {
   pi.registerCommand("llama-swap-url", {
-    description: "Set the llama-swap provider base URL",
-    handler: async (_args, ctx) => {
-      const current = resolveBaseUrl() ?? "(not set)";
-      const prompt = `Current: ${current}\nEnter new base URL (without /v1, e.g. http://localhost:8080):`;
+    description: "Manage llama-swap servers (no args: add a server; 'add <name> <url>'; 'remove <name>')",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
 
-      const input = await ctx.ui.input(prompt);
-      if (!input) {
-        ctx.ui.notify("URL unchanged.", "info");
+      if (parts[0] === "add" && parts.length === 3) {
+        const normalized = setServer(parts[1], parts[2]);
+        ctx.ui.notify(`llama-swap server "${parts[1]}" (provider ${parts[1].replace(/[^a-zA-Z0-9-]/g, "-")}) set to: ${normalized}`, "info");
+        ctx.ui.notify("Run /reload to apply.", "info");
         return;
       }
 
-      const normalized = setLlamaSwapUrl(input);
-      ctx.ui.notify(`llama-swap URL set to: ${normalized}`, "info");
+      if (parts[0] === "remove" && parts.length === 2) {
+        if (removeServer(parts[1])) {
+          ctx.ui.notify(`llama-swap server "${parts[1]}" removed.`, "info");
+          ctx.ui.notify("Run /reload to apply.", "info");
+        } else {
+          ctx.ui.notify(`No server named "${parts[1]}" in llamaSwap.servers.`, "error");
+        }
+        return;
+      }
+
+      if (parts.length > 0) {
+        ctx.ui.notify("Usage: /llama-swap-url | add <name> <url> | remove <name>", "error");
+        return;
+      }
+
+      const servers = resolveServers();
+      const current = servers.length > 0 ? servers.map((s) => `${s.providerId} = ${s.url}`).join(", ") : "(none configured)";
+      const name = (await ctx.ui.input(`Configured: ${current}\nEnter server name (empty to cancel):`))?.trim();
+      if (!name) {
+        ctx.ui.notify("No changes.", "info");
+        return;
+      }
+
+      const url = await ctx.ui.input(`Enter base URL for "${name}" (without /v1, e.g. http://localhost:8080):`);
+      if (!url) {
+        ctx.ui.notify(`No URL entered; "${name}" unchanged.`, "info");
+        return;
+      }
+
+      const normalized = setServer(name, url);
+      ctx.ui.notify(`llama-swap server "${name}" (provider ${name.replace(/[^a-zA-Z0-9-]/g, "-")}) set to: ${normalized}`, "info");
       ctx.ui.notify("Run /reload to apply the new URL.", "info");
     },
   });
@@ -707,93 +815,114 @@ export default async function (pi: ExtensionAPI) {
   registerExportCommand(pi);
   registerSwapStatsCommand(pi);
 
-  const BASE_URL = resolveBaseUrl();
-  if (!BASE_URL) {
-    console.log("[llama-swap] No URL configured (llamaSwap.baseUrl in settings.json). Provider not registered.");
+  const servers = resolveServers();
+  if (servers.length === 0) {
+    console.log("[llama-swap] No servers configured (llamaSwap.servers in settings.json). Providers not registered.");
     return;
   }
 
-  try {
-    const response = await fetch(`${BASE_URL}/models`);
-    if (!response.ok) {
-      throw new Error(`llama-swap API returned ${response.status}: ${response.statusText}`);
-    }
-
-    const payload = (await response.json()) as {
-      data: Array<{
-        id: string;
-        name?: string;
-        object?: string;
-        created?: number;
-        owned_by?: string;
-        capabilities?: Record<string, unknown>;
-        architecture?: {
-          input_modalities?: string[];
-          modality?: string;
-        };
-        context_length?: number;
-      }>;
-      object?: string;
-    };
-
-    const models = payload.data.map(mapModel);
-
-    // Built-in openai-completions stream implementation, wrapped with a teed
-    // fetch that taps the raw SSE stream for llama.cpp usage/timings fields.
-    const openai = getApiProvider("openai-completions");
-    if (!openai) {
-      throw new Error("openai-completions API provider not found in pi-ai registry");
-    }
-
-    pi.registerProvider("llama-swap", {
-      baseUrl: BASE_URL,
-      apiKey: "none", // llama-swap is a local service, no auth needed
-      api: "openai-completions",
-      models,
-      streamSimple: (model, context, options) => {
-        const baseFetch = options?.fetch ?? globalThis.fetch;
-        return openai.streamSimple(model, context, { ...options, fetch: teedFetch(baseFetch) });
-      },
-    });
-
-    // Persist captured usage/timings into the session record, correlated via
-    // the chat completion id that pi stores as `responseId` on the message.
-    // Uses turn_end (not message_end) so the custom entry is appended AFTER
-    // the assistant message entry is already persisted, keeping the record
-    // attached directly below its message in the session file.
-    pi.on("turn_end", async (event) => {
-      const message = event.message;
-      if (message.role !== "assistant" || message.provider !== "llama-swap") return;
-      if (!message.responseId) return;
-
-      const capture = captures.get(message.responseId);
-      if (!capture) return;
-
-      // The tap usually finishes with the stream; give it a moment to land.
-      await Promise.race([capture.ready, new Promise((r) => setTimeout(r, 2000))]);
-      const record = capture.record;
-      if (!record || (!record.usage && !record.timings && !record.metrics)) return;
-
-      captures.delete(record.responseId);
-      pi.appendEntry("llama-swap-usage", record);
-    });
-
-    pi.registerEntryRenderer("llama-swap-usage", (entry, { expanded }, theme) => {
-      const record = entry.data as LlamaSwapUsageRecord | undefined;
-      if (!record) return undefined;
-
-      const box = new Box(0, 0);
-      box.addChild(new Text(theme.fg("dim", `\u26A1 llama-swap ${formatUsageSummary(record)}`)));
-      if (expanded) {
-        box.addChild(new Text(theme.fg("dim", JSON.stringify(record, null, 2))));
-      }
-      return box;
-    });
-  } catch (error) {
-    console.error(
-      `[llama-swap] Failed to discover models from ${BASE_URL}/models:`,
-      error instanceof Error ? error.message : String(error),
-    );
-    console.error("[llama-swap] Provider will not be available. Is llama-swap running?");
+  // Built-in openai-completions stream implementation, shared by all servers.
+  const openai = getApiProvider("openai-completions");
+  if (!openai) {
+    console.error("[llama-swap] openai-completions API provider not found in pi-ai registry. Providers not registered.");
+    return;
   }
+
+  // Discover and register each server independently, so one unreachable
+  // server does not prevent the others from being registered.
+  const providerIds = new Set<string>();
+  const results = await Promise.allSettled(
+    servers.map(async (server) => {
+      const response = await fetch(`${server.url}/models`);
+      if (!response.ok) {
+        throw new Error(`llama-swap API returned ${response.status}: ${response.statusText}`);
+      }
+
+      const payload = (await response.json()) as {
+        data: Array<{
+          id: string;
+          name?: string;
+          object?: string;
+          created?: number;
+          owned_by?: string;
+          capabilities?: Record<string, unknown>;
+          architecture?: {
+            input_modalities?: string[];
+            modality?: string;
+          };
+          context_length?: number;
+        }>;
+        object?: string;
+      };
+
+      const models = payload.data.map(mapModel);
+
+      // Wrapped with a teed fetch that taps the raw SSE stream for
+      // llama.cpp usage/timings fields.
+      pi.registerProvider(server.providerId, {
+        baseUrl: server.url,
+        apiKey: "none", // llama-swap is a local service, no auth needed
+        api: "openai-completions",
+        models,
+        streamSimple: (model, context, options) => {
+          const baseFetch = options?.fetch ?? globalThis.fetch;
+          return openai.streamSimple(model, context, { ...options, fetch: teedFetch(baseFetch) });
+        },
+      });
+
+      providerIds.add(server.providerId);
+      console.log(`[llama-swap] Registered "${server.providerId}" (${models.length} models) from ${server.url}`);
+    }),
+  );
+
+  results.forEach((result, i) => {
+    if (result.status === "rejected") {
+      console.error(
+        `[llama-swap] Failed to discover models from ${servers[i].url}/models:`,
+        result.reason instanceof Error ? result.reason.message : String(result.reason),
+      );
+    }
+  });
+
+  if (providerIds.size === 0) {
+    console.error("[llama-swap] No servers responded. Providers will not be available. Is llama-swap running?");
+    return;
+  }
+
+  // Persist captured usage/timings into the session record, correlated via
+  // the chat completion id that pi stores as `responseId` on the message.
+  // Uses turn_end (not message_end) so the custom entry is appended AFTER
+  // the assistant message entry is already persisted, keeping the record
+  // attached directly below its message in the session file.
+  pi.on("turn_end", async (event) => {
+    const message = event.message;
+    if (message.role !== "assistant") return;
+    if (!providerIds.has(message.provider)) return;
+    if (!message.responseId) return;
+
+    const capture = captures.get(message.responseId);
+    if (!capture) return;
+
+    // The tap usually finishes with the stream; give it a moment to land.
+    await Promise.race([capture.ready, new Promise((r) => setTimeout(r, 2000))]);
+    const record = capture.record;
+    if (!record || (!record.usage && !record.timings && !record.metrics)) return;
+
+    record.server = message.provider;
+    captures.delete(record.responseId);
+    pi.appendEntry("llama-swap-usage", record);
+  });
+
+  pi.registerEntryRenderer("llama-swap-usage", (entry, { expanded }, theme) => {
+    const record = entry.data as LlamaSwapUsageRecord | undefined;
+    if (!record) return undefined;
+
+    const box = new Box(0, 0);
+    const serverTag = record.server ? ` [${record.server}]` : "";
+    box.addChild(new Text(theme.fg("dim", `\u26A1 llama-swap${serverTag} ${formatUsageSummary(record)}`)));
+    if (expanded) {
+      box.addChild(new Text(theme.fg("dim", JSON.stringify(record, null, 2))));
+    }
+    return box;
+  });
 }

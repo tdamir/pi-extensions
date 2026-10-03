@@ -28,17 +28,17 @@ pi --extension git:github.com/tdamir/pi-extensions
 
 Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider.
 
-It dynamically discovers available models from your local llama-swap instance at startup and makes them available to the pi coding agent.
+It dynamically discovers available models from each configured llama-swap server at startup and registers one pi provider per server — named after the server — ready to use in the pi coding agent.
 
 ### Features
 
-- **Auto-discovery** — Fetches the full model list from llama-swap's `/models` API on load
+- **Auto-discovery** — Fetches the full model list from each server's `/models` API on load; an unreachable server is skipped without blocking the others
 - **OpenAI-compatible** — Uses the `openai-completions` API format, so it works with any OpenAI-style client
 - **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
 - **Pinned reasoning effort** — Models with a `:{level}` suffix (e.g. `qwen3-coder:medium`) are pinned to that thinking level; all other levels are hidden for them
 - **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings` and vLLM's `usage`/`metrics` — and shows it under each assistant message
 - **HTML export with stats** — `/export-with-stats` exports the session to HTML with the usage stats included (the built-in `/export` skips them)
-- **Configurable URL** — Set your llama-swap server address via settings or the `/llama-swap-url` command
+- **Configurable servers** — One or more llama-swap server addresses via settings or the `/llama-swap-url` command
 - **Hot-reload** — Changes apply automatically on `/reload`
 
 ### Prerequisites
@@ -48,28 +48,56 @@ It dynamically discovers available models from your local llama-swap instance at
 
 ### Configuration
 
-#### Setting the llama-swap URL (required)
+#### Setting the llama-swap servers (required)
 
-The provider **requires** a configured base URL. If `llamaSwap.baseUrl` is not set, the provider is not registered (you'll see a notice in the console at startup).
+The provider **requires** at least one configured server. If `llamaSwap.servers` is empty or missing, no provider is registered (you'll see a notice in the console at startup). Each entry in `llamaSwap.servers` becomes a provider named after its key:
 
-To set it:
+```json
+{
+  "llamaSwap": {
+    "servers": {
+      "gx10": "http://gx10.local:8080"
+    }
+  }
+}
+```
 
-1. Run the interactive command:
-   ```
-   /llama-swap-url
-   ```
-   Then enter your llama-swap base URL (without `/v1`).
+You can also manage it interactively:
 
-2. Or edit `~/.pi/agent/settings.json` directly:
-   ```json
-   {
-     "llamaSwap": {
-       "baseUrl": "http://your-server:8080"
-     }
-   }
-   ```
+```
+/llama-swap-url                  # add a server (prompt for name and URL)
+```
 
-The provider will automatically append `/v1` to the base URL.
+Then enter a server name and its llama-swap base URL (without `/v1`).
+
+The provider will automatically append `/v1` to each base URL.
+
+#### Multiple servers
+
+Run several llama-swap instances (e.g. llama.cpp on one GPU, vLLM on another) and register them all — each key in `servers` becomes a provider of the same name:
+
+```json
+{
+  "llamaSwap": {
+    "servers": {
+      "gx10": "http://gx10.local:8080",
+      "gb10": "http://gb10.local:8000"
+    }
+  }
+}
+```
+
+Models are namespaced per provider, so two servers exposing the same model id are both usable — pick `gx10/gemma` vs `gb10/gemma` when switching models. An unreachable server is skipped at startup without preventing the others from registering.
+
+Manage servers from the TUI:
+
+```
+/llama-swap-url                               # list servers + add one (prompt)
+/llama-swap-url add gx10 http://gx10.local:8080 # add a server
+/llama-swap-url remove gx10                   # remove a server
+```
+
+`/reload` is required after changes.
 
 #### Project-scoped configuration
 
@@ -96,6 +124,8 @@ In the TUI, each entry renders as a dimmed one-liner, e.g.:
 ⚡ llama-swap prompt 420 tok/s · gen 28.4 tok/s · draft 12/20 · 512→384 tok (256 cached)
 ```
 
+With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx10] …`.
+
 - **prompt tok/s** — prompt processing speed
 - **gen tok/s** — generation speed
 - **draft n/m** — speculative-decoding draft acceptance (when applicable)
@@ -103,7 +133,7 @@ In the TUI, each entry renders as a dimmed one-liner, e.g.:
 
 Press the expand key on the entry to see the full raw `usage`/`timings`/`metrics` JSON. Captured records also persist in the session file, so the stats survive across sessions.
 
-Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, draft acceptance, and the five most recent requests). The panel is computed from the session log, so it works across reloads and resumed sessions.
+Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, draft acceptance, and the five most recent requests). The panel is computed from the session log, so it works across reloads and resumed sessions. With multiple servers, the panel groups the stats per provider and tags the recent requests with the serving provider.
 
 ### Exporting the session to HTML
 
@@ -114,7 +144,7 @@ The built-in `/export` command skips `llama-swap-usage` entries, so the stats ar
 /export-with-stats path/to/out.html  # export to a specific file
 ```
 
-Each turn's stats appear in the export as a one-liner under the corresponding assistant message, e.g. `⚡ llama-swap — prompt 420 tok/s · gen 28.4 tok/s · 512→384 tok`.
+Each turn's stats appear in the export as a one-liner under the corresponding assistant message, e.g. `⚡ llama-swap — prompt 420 tok/s · gen 28.4 tok/s · 512→384 tok` (tagged with the provider name, e.g. `⚡ llama-swap [gx10] — …`, when multiple servers are configured).
 
 ### llama-swap model configuration
 
@@ -140,7 +170,7 @@ If llama-swap exposes fixed-effort model variants with a `:{level}` suffix (`off
 
 ### Usage
 
-After installation and a `/reload`, models from your llama-swap instance will be available as the `llama-swap` provider in pi. Select it like any other provider when chatting with the agent.
+After installation and a `/reload`, models from each configured server are available in pi, each under the provider named after the server (e.g. `gx10/<model>`, `gb10/<model>`). Select them like any other provider when chatting with the agent.
 
 ## handoff
 
