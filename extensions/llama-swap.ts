@@ -37,6 +37,22 @@ import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 // =============================================================================
+// Logging
+// =============================================================================
+
+/**
+ * In interactive mode, console output written while the extension factory
+ * runs is rendered as messages in the TUI. Since the factory re-runs on
+ * every new session, resume, and /reload, unconditional logging there floods
+ * the screen. Info logs are therefore gated behind PI_LLAMA_SWAP_DEBUG; only
+ * real failures still print.
+ */
+const DEBUG_LOG = process.env.PI_LLAMA_SWAP_DEBUG === "1" || process.env.PI_LLAMA_SWAP_DEBUG === "true";
+const debugLog = (...args: unknown[]): void => {
+  if (DEBUG_LOG) console.log(...args);
+};
+
+// =============================================================================
 // Configuration
 // =============================================================================
 
@@ -817,7 +833,7 @@ export default async function (pi: ExtensionAPI) {
 
   const servers = resolveServers();
   if (servers.length === 0) {
-    console.log("[llama-swap] No servers configured (llamaSwap.servers in settings.json). Providers not registered.");
+    debugLog("[llama-swap] No servers configured (llamaSwap.servers in settings.json). Providers not registered.");
     return;
   }
 
@@ -871,7 +887,7 @@ export default async function (pi: ExtensionAPI) {
       });
 
       providerIds.add(server.providerId);
-      console.log(`[llama-swap] Registered "${server.providerId}" (${models.length} models) from ${server.url}`);
+      debugLog(`[llama-swap] Registered "${server.providerId}" (${models.length} models) from ${server.url}`);
     }),
   );
 
