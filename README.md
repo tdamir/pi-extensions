@@ -37,7 +37,7 @@ It dynamically discovers available models from each configured llama-swap server
 - **OpenAI-compatible** — Uses the `openai-completions` API format, so it works with any OpenAI-style client
 - **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
 - **Pinned reasoning effort** — Models with a `:{level}` suffix (e.g. `qwen3-coder:medium`) are pinned to that thinking level; all other levels are hidden for them
-- **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings` and vLLM's `usage`/`metrics` — and shows it under each assistant message
+- **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings`, vLLM's `usage`/`metrics`, and tensorfold's `tensorfold`/`speculative`/`exact_mode` diagnostics — and shows it under each assistant message
 - **HTML export with stats** — `/export-with-stats` exports the session to HTML with the usage stats included (the built-in `/export` skips them)
 - **Configurable servers** — One or more llama-swap server addresses via settings or the `/llama-swap-url` command
 - **Hot-reload** — Changes apply automatically on `/reload`
@@ -112,29 +112,31 @@ This is useful for sharing configuration with your team.
 
 ### Token & performance stats
 
-For every llama-swap turn, the provider captures the raw `usage` and timing SSE fields — llama.cpp's `timings` or vLLM's `metrics` — and stores them as `llama-swap-usage` entries in the session record, placed directly below the corresponding assistant message.
+For every llama-swap turn, the provider captures the raw `usage` and timing SSE fields — llama.cpp's `timings`, vLLM's `metrics`, or tensorfold's `tensorfold`/`speculative`/`exact_mode` diagnostics — and stores them as `llama-swap-usage` entries in the session record, placed directly below the corresponding assistant message.
 
-Both server formats are normalized to the same summary:
+All server formats are normalized to the same summary:
 
 - **llama.cpp** — `timings` (`prompt_ms`/`prompt_n`, `predicted_ms`/`predicted_n`, `draft_n`/`draft_n_accepted`)
 - **vLLM / OpenAI-style** — `metrics` (`time_to_first_token_ms`, `generation_time_ms`, `tokens_per_second`, and `speculative_decoding` counts) plus `usage.prompt_tokens_details.cached_tokens`
+- **tensorfold** — `tensorfold` (`engine`, `seconds`, `prefill_seconds`, `time_to_first_token`, `tokens_per_second`, `sampling`, `token_sha`, …), `speculative` (`rounds`, `drafted`, `accepted`, `acceptance_rate`, `tokens_per_round`), and `exact_mode`
 
 In the TUI, each entry renders as a dimmed one-liner, e.g.:
 
 ```
 ⚡ llama-swap prompt 420 tok/s · gen 28.4 tok/s · draft 12/20 · 512→384 tok (256 cached)
+⚡ llama-swap [gx10] lanes/exact · prompt 1674 tok/s · gen 77.5 tok/s · draft 94/148 (64%) · 2.9s · 6081→132 tok (4096 cached)
 ```
 
-With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx10] …`.
+With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx10] …`. tensorfold responses additionally show an `engine/sampling` tag (e.g. `lanes/exact`).
 
 - **prompt tok/s** — prompt processing speed
 - **gen tok/s** — generation speed
 - **draft n/m** — speculative-decoding draft acceptance (when applicable)
 - **tokens** — prompt→completion tokens, with cached prompt tokens in parentheses
 
-Press the expand key on the entry to see the full raw `usage`/`timings`/`metrics` JSON. Captured records also persist in the session file, so the stats survive across sessions.
+Press the expand key on the entry to see the full raw `usage`/`timings`/`metrics`/`tensorfold` JSON. tensorfold records also get a formatted diagnostics block above the JSON (engine, thinking/effort, sampling mode and `token_sha`, TTFT/prefill/decode/total times, prefill widths and raised batches, and speculative rounds). Captured records also persist in the session file, so the stats survive across sessions.
 
-Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, draft acceptance, and the five most recent requests). The panel is computed from the session log, so it works across reloads and resumed sessions. With multiple servers, the panel groups the stats per provider and tags the recent requests with the serving provider.
+Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, average TTFT, draft acceptance and speculative rounds, engine and exact-mode counts, and the five most recent requests). The panel is computed from the session log, so it works across reloads and resumed sessions. With multiple servers, the panel groups the stats per provider and tags the recent requests with the serving provider.
 
 ### Exporting the session to HTML
 

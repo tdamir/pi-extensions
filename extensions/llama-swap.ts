@@ -4,7 +4,8 @@
  * Registers llama-swap as an OpenAI-compatible provider.
  * Dynamically discovers models from the llama-swap API at startup.
  * Captures the raw SSE telemetry dropped by the built-in parser — llama.cpp's
- * `usage` and `timings`, and vLLM's `usage` and `metrics` — and stores them as
+ * `usage` and `timings`, vLLM's `usage` and `metrics`, and tensorfold's
+ * `tensorfold`/`speculative`/`exact_mode` diagnostics — and stores them as
  * `llama-swap-usage` custom entries in the session record.
  *
  * /swap-stats toggles a panel with aggregate stats (token throughput, rates,
@@ -282,6 +283,55 @@ interface LlamaMetrics {
   [key: string]: unknown;
 }
 
+/**
+ * tensorfold diagnostics (emitted on the final chunk, alongside `exact_mode`).
+ * Times are in seconds here (unlike llama.cpp/vLLM, which use ms).
+ */
+interface TensorfoldDiagnostics {
+  /** Whether the server applied a thinking/reasoning template. */
+  enable_thinking?: boolean;
+  /** Reasoning effort the server actually used (`null` when unset/auto). */
+  reasoning_effort?: string | null;
+  /** Engine that served the request (e.g. `lanes`). */
+  engine?: string;
+  /** Generation throughput (completion tokens per decode second). */
+  tokens_per_second?: number;
+  /** Total wall time for the request, prefill included. */
+  seconds?: number;
+  /** Prefill time in seconds. */
+  prefill_seconds?: number;
+  /** Prefill batch widths used by the engine (engine-specific). */
+  prefill_widths?: number[];
+  /** Prefill batches the engine raised (engine-specific). */
+  prefill_raised?: number[];
+  /** End-to-end time to first token. */
+  time_to_first_token?: number;
+  /** Sampling mode the server applied (e.g. `exact`). */
+  sampling?: string;
+  /** Whether speculative drafting was enabled. */
+  drafts?: boolean;
+  /** Deterministic hash of the produced token sequence (exactness check). */
+  token_sha?: string;
+  /** Minimum row count the engine batched at (engine-specific). */
+  min_rows?: number;
+  [key: string]: unknown;
+}
+
+/** tensorfold speculative-decoding counters (same final chunk as `tensorfold`). */
+interface SpeculativeDiagnostics {
+  /** Speculative rounds run. */
+  rounds?: number;
+  /** Draft tokens proposed. */
+  drafted?: number;
+  /** Draft tokens accepted. */
+  accepted?: number;
+  /** Accepted / drafted (server-provided). */
+  acceptance_rate?: number;
+  /** Mean completion tokens produced per round. */
+  tokens_per_round?: number;
+  [key: string]: unknown;
+}
+
 interface LlamaSwapUsageRecord {
   responseId: string;
   /** Provider (server) id that served the request. */
@@ -291,6 +341,11 @@ interface LlamaSwapUsageRecord {
   usage?: LlamaUsage;
   timings?: LlamaTimings;
   metrics?: LlamaMetrics;
+  /** tensorfold diagnostics; also implies the timings source. */
+  tensorfold?: TensorfoldDiagnostics;
+  speculative?: SpeculativeDiagnostics;
+  /** Sampling mode echoed by tensorfold (e.g. `exact`). */
+  exactMode?: string;
   capturedAt: number;
 }
 
@@ -335,6 +390,9 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
         usage?: LlamaUsage;
         timings?: LlamaTimings;
         metrics?: LlamaMetrics;
+        tensorfold?: TensorfoldDiagnostics;
+        speculative?: SpeculativeDiagnostics;
+        exact_mode?: string;
       };
       try {
         chunk = JSON.parse(data);
@@ -349,6 +407,9 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
       if (chunk.usage && typeof chunk.usage === "object") record.usage = chunk.usage;
       if (chunk.timings && typeof chunk.timings === "object") record.timings = chunk.timings;
       if (chunk.metrics && typeof chunk.metrics === "object") record.metrics = chunk.metrics;
+      if (chunk.tensorfold && typeof chunk.tensorfold === "object") record.tensorfold = chunk.tensorfold;
+      if (chunk.speculative && typeof chunk.speculative === "object") record.speculative = chunk.speculative;
+      if (typeof chunk.exact_mode === "string") record.exactMode = chunk.exact_mode;
     };
 
     try {
@@ -371,7 +432,10 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
       } catch {
         // ignore
       }
-      if (record.responseId && (record.usage || record.timings || record.metrics)) {
+      if (
+        record.responseId &&
+        (record.usage || record.timings || record.metrics || record.tensorfold || record.speculative)
+      ) {
         rememberCapture(record);
       }
     }
@@ -401,11 +465,11 @@ function teedFetch(base: typeof globalThis.fetch): typeof globalThis.fetch {
 // =============================================================================
 
 interface NormalizedTimings {
-  /** Prefill/prompt time in ms (llama.cpp prompt_ms, vLLM time_to_first_token_ms). */
+  /** Prefill/prompt time in ms (llama.cpp prompt_ms, vLLM time_to_first_token_ms, tensorfold prefill_seconds). */
   promptMs: number;
   /** Prompt tokens actually prefilled (llama.cpp prompt_n, vLLM prompt_tokens minus cached). */
   promptN: number;
-  /** Generation time in ms (llama.cpp predicted_ms, vLLM generation_time_ms). */
+  /** Generation time in ms (llama.cpp predicted_ms, vLLM generation_time_ms, tensorfold seconds minus prefill). */
   predictedMs: number;
   /** Generated tokens (llama.cpp predicted_n, vLLM completion_tokens). */
   predictedN: number;
@@ -420,8 +484,8 @@ interface NormalizedTimings {
 }
 
 /**
- * Normalize llama.cpp `timings` and vLLM `metrics` into one shape so the
- * summary line and aggregate stats work with either server.
+ * Normalize llama.cpp `timings`, tensorfold diagnostics, and vLLM `metrics`
+ * into one shape so the summary line and aggregate stats work with any server.
  */
 function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | undefined {
   const t = record.timings;
@@ -435,6 +499,26 @@ function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | und
       draftAccepted: t.draft_n_accepted ?? 0,
       ...(t.prompt_per_second != null ? { promptRate: t.prompt_per_second } : {}),
       ...(t.predicted_per_second != null ? { genRate: t.predicted_per_second } : {}),
+    };
+  }
+
+  const tf = record.tensorfold;
+  if (tf) {
+    const u = record.usage;
+    const spec = record.speculative;
+    // `seconds` covers the whole request, so decode time is the remainder
+    // after prefill. `tokens_per_second` is reported against that remainder
+    // (e.g. 132 tok / (2.877s - 1.186s) ≈ 77.5 tok/s).
+    const totalMs = (tf.seconds ?? 0) * 1000;
+    const promptMs = (tf.prefill_seconds ?? 0) * 1000;
+    return {
+      promptMs,
+      promptN: Math.max(0, (u?.prompt_tokens ?? 0) - (u?.prompt_tokens_details?.cached_tokens ?? 0)),
+      predictedMs: Math.max(0, totalMs - promptMs),
+      predictedN: u?.completion_tokens ?? 0,
+      draftN: spec?.drafted ?? 0,
+      draftAccepted: spec?.accepted ?? 0,
+      ...(tf.tokens_per_second != null ? { genRate: tf.tokens_per_second } : {}),
     };
   }
 
@@ -461,6 +545,12 @@ function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | und
 /** One-line human-readable summary of a captured usage record. */
 function formatUsageSummary(record: LlamaSwapUsageRecord): string {
   const parts: string[] = [];
+  const tf = record.tensorfold;
+  if (tf) {
+    // Tag the engine and sampling mode first, e.g. `lanes/exact`.
+    const tags = [tf.engine, record.exactMode ?? tf.sampling].filter((tag): tag is string => !!tag);
+    if (tags.length > 0) parts.push(tags.join("/"));
+  }
   const nt = normalizeTimings(record);
   if (nt) {
     const promptRate = nt.promptRate ?? (nt.promptMs > 0 && nt.promptN > 0 ? nt.promptN / (nt.promptMs / 1000) : undefined);
@@ -482,6 +572,66 @@ function formatUsageSummary(record: LlamaSwapUsageRecord): string {
     parts.push(`${u.prompt_tokens ?? 0}\u2192${u.completion_tokens ?? 0} tok${cached}`);
   }
   return parts.length > 0 ? parts.join(" \u00B7 ") : "no usage data";
+}
+
+/**
+ * Multi-line breakdown of the tensorfold diagnostics, shown when a
+ * llama-swap-usage entry is expanded. Empty when the server did not report any.
+ */
+function formatDiagnosticsLines(record: LlamaSwapUsageRecord): string[] {
+  const tf = record.tensorfold;
+  if (!tf) return [];
+
+  const secs = (value: number | undefined) => (value != null ? `${value.toFixed(2)}s` : "\u2014");
+  const decodeSecs =
+    tf.seconds != null && tf.prefill_seconds != null ? Math.max(0, tf.seconds - tf.prefill_seconds) : undefined;
+  const engine = [
+    tf.engine ?? "\u2014",
+    tf.drafts != null ? `drafts ${tf.drafts ? "on" : "off"}` : undefined,
+    tf.min_rows != null ? `min_rows ${tf.min_rows}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" \u00B7 ");
+  const thinking = [
+    tf.enable_thinking != null ? `thinking ${tf.enable_thinking ? "on" : "off"}` : undefined,
+    tf.reasoning_effort ? `effort ${tf.reasoning_effort}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" \u00B7 ");
+  const sampling = [
+    record.exactMode ?? tf.sampling ?? "\u2014",
+    tf.token_sha ? `sha ${tf.token_sha}` : undefined,
+  ]
+    .filter(Boolean)
+    .join(" \u00B7 ");
+  const prefill = [
+    `widths ${tf.prefill_widths?.length ? tf.prefill_widths.join(",") : "\u2014"}`,
+    `raised ${tf.prefill_raised?.length ? tf.prefill_raised.join(",") : "\u2014"}`,
+  ].join(" \u00B7 ");
+
+  const lines: string[] = [
+    `engine      ${engine}`,
+    `thinking    ${thinking || "\u2014"}`,
+    `sampling    ${sampling}`,
+    `timings     ttft ${secs(tf.time_to_first_token)} \u00B7 prefill ${secs(tf.prefill_seconds)} \u00B7 decode ${secs(decodeSecs)} \u00B7 total ${secs(tf.seconds)}`,
+    `throughput  ${tf.tokens_per_second != null ? `${tf.tokens_per_second.toFixed(1)} tok/s` : "\u2014"}`,
+    `prefill     ${prefill}`,
+  ];
+
+  const spec = record.speculative;
+  if (spec) {
+    const pct =
+      spec.acceptance_rate != null
+        ? `${(spec.acceptance_rate * 100).toFixed(1)}%`
+        : spec.drafted
+          ? `${(((spec.accepted ?? 0) / spec.drafted) * 100).toFixed(1)}%`
+          : "\u2014";
+    lines.push(
+      `speculative ${spec.rounds ?? 0} rounds \u00B7 ${spec.drafted ?? 0} drafted \u00B7 ${spec.accepted ?? 0} accepted (${pct}) \u00B7 ${spec.tokens_per_round != null ? spec.tokens_per_round.toFixed(2) : "\u2014"} tok/round`,
+    );
+  }
+
+  return lines;
 }
 
 interface SessionEntryLike {
@@ -580,6 +730,18 @@ interface SwapLogStats {
   predictedN: number;
   draftN: number;
   draftAccepted: number;
+  /** Speculative rounds run (tensorfold). */
+  specRounds: number;
+  /** Requests that reported tensorfold diagnostics. */
+  tfRequests: number;
+  /** tensorfold requests served in exact sampling mode. */
+  exactRequests: number;
+  /** Engines seen (tensorfold `engine`). */
+  engines: Set<string>;
+  /** Sum of tensorfold time-to-first-token, in ms. */
+  ttftMs: number;
+  /** Number of requests that reported a time-to-first-token. */
+  ttftCount: number;
   firstAt: number;
   lastAt: number;
 }
@@ -616,6 +778,12 @@ function computeStats(records: UsageRecordEntry[]): SwapLogStats {
     predictedN: 0,
     draftN: 0,
     draftAccepted: 0,
+    specRounds: 0,
+    tfRequests: 0,
+    exactRequests: 0,
+    engines: new Set<string>(),
+    ttftMs: 0,
+    ttftCount: 0,
     firstAt: Infinity,
     lastAt: 0,
   };
@@ -641,6 +809,17 @@ function computeStats(records: UsageRecordEntry[]): SwapLogStats {
       stats.draftN += nt.draftN;
       stats.draftAccepted += nt.draftAccepted;
     }
+    const tf = record.tensorfold;
+    if (tf) {
+      stats.tfRequests += 1;
+      if (tf.engine) stats.engines.add(tf.engine);
+      if ((record.exactMode ?? tf.sampling) === "exact") stats.exactRequests += 1;
+      if (tf.time_to_first_token != null) {
+        stats.ttftMs += tf.time_to_first_token * 1000;
+        stats.ttftCount += 1;
+      }
+    }
+    if (record.speculative?.rounds) stats.specRounds += record.speculative.rounds;
   }
 
   return stats;
@@ -705,9 +884,22 @@ function registerSwapStatsCommand(pi: ExtensionAPI) {
         if (promptRate) lines.push(row("Prompt", `\u2248 ${promptRate} tok/s`));
         const genRate = tokS(stats.predictedN, stats.predictedMs);
         if (genRate) lines.push(row("Generation", `\u2248 ${genRate} tok/s`));
+        if (stats.ttftCount > 0) {
+          lines.push(row("TTFT", `\u2248 ${(stats.ttftMs / stats.ttftCount / 1000).toFixed(2)}s avg`));
+        }
         if (stats.draftN > 0) {
           const pct = ((stats.draftAccepted / stats.draftN) * 100).toFixed(0);
-          lines.push(row("Draft", `${stats.draftAccepted}/${stats.draftN} accepted (${pct}%)`));
+          const rounds =
+            stats.specRounds > 0
+              ? ` \u00B7 ${stats.specRounds} rounds \u00B7 ${(stats.predictedN / stats.specRounds).toFixed(1)} tok/round`
+              : "";
+          lines.push(row("Draft", `${stats.draftAccepted}/${stats.draftN} accepted (${pct}%)${rounds}`));
+        }
+        if (stats.engines.size > 0) {
+          lines.push(row("Engine", [...stats.engines].join(", ")));
+        }
+        if (stats.exactRequests > 0) {
+          lines.push(row("Exact", `${stats.exactRequests}/${stats.tfRequests} requests`));
         }
         const wallMs = stats.predictedMs + stats.promptMs;
         if (wallMs > 0) lines.push(row("LLM time", `${(wallMs / 1000).toFixed(1)}s total`));
@@ -922,7 +1114,7 @@ export default async function (pi: ExtensionAPI) {
     // The tap usually finishes with the stream; give it a moment to land.
     await Promise.race([capture.ready, new Promise((r) => setTimeout(r, 2000))]);
     const record = capture.record;
-    if (!record || (!record.usage && !record.timings && !record.metrics)) return;
+    if (!record || (!record.usage && !record.timings && !record.metrics && !record.tensorfold)) return;
 
     record.server = message.provider;
     captures.delete(record.responseId);
@@ -937,6 +1129,9 @@ export default async function (pi: ExtensionAPI) {
     const serverTag = record.server ? ` [${record.server}]` : "";
     box.addChild(new Text(theme.fg("dim", `\u26A1 llama-swap${serverTag} ${formatUsageSummary(record)}`)));
     if (expanded) {
+      for (const line of formatDiagnosticsLines(record)) {
+        box.addChild(new Text(theme.fg("dim", line)));
+      }
       box.addChild(new Text(theme.fg("dim", JSON.stringify(record, null, 2))));
     }
     return box;
