@@ -7,7 +7,9 @@
     "llama-swap",
     "llm-provider",
     "handoff",
-    "benchmark"
+    "benchmark",
+    "screenshot",
+    "screen-capture"
   ],
   "description": "A collection of pi extensions: llama-swap LLM provider and handoff (transfer context to a new focused session)",
 
@@ -46,9 +48,9 @@
   },
   "devDependencies": {
     "@types/node": "^26.1.0",
-    "@earendil-works/pi-ai": "0.84.2",
-    "@earendil-works/pi-coding-agent": "0.84.2",
-    "@earendil-works/pi-tui": "0.84.2"
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "@earendil-works/pi-tui": "1.3.0"
 
   }
 }

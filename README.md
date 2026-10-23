@@ -9,6 +9,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [session-name](#session-name) | Auto-generates a session name from the conversation (fresh excerpt or full cached session), or set it manually |
 | [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs |
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
+| [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
 
 ## Installation
 
@@ -281,6 +282,39 @@ Context usage: 45,231 / 200,000 tokens (22.6%)
 Free: 154,769 tokens
 ```
 
+## screenshot
+
+Screen capture for the agent: it can see your screen and windows.
+
+### Features
+
+- **`screenshot` tool** — Captures the whole virtual desktop (all monitors combined), a single monitor, or a specific application window. Returns the image to the model (so it can actually look at the result) and saves the PNG to disk
+- **`list_windows` tool** — Lists visible, capturable windows (title, pid, process, size) in z-order so the agent can pick a target
+- **`/screenshot` command** — Manual capture without the LLM: `/screenshot [desktop|monitor <index>|window "<title>"] [savePath]`
+- **Window capture that works** — Uses `PrintWindow` with `PW_RENDERFULLCONTENT`, so occluded windows and Chromium/Electron apps capture correctly; GPU-composited windows that ignore it fall back to a screen-region copy with a note in the result
+- **DPI-correct** — Physical pixel dimensions on high-DPI displays; images are downscaled (default 1600 px wide) to keep model payloads small
+- **Zero dependencies (Windows)** — Built on Windows PowerShell 5.1 + .NET `System.Drawing`, both shipped with Windows
+
+### Usage examples
+
+Ask the agent:
+
+```
+Take a screenshot of my desktop and tell me what's on screen
+Screenshot the window titled "Visual Studio Code" and check for build errors
+List my windows, then capture the one from the error dialog
+```
+
+Or capture manually:
+
+```
+/screenshot
+/screenshot monitor 1
+/screenshot window "Sparks" C:\shots\terminal.png
+```
+
+Windows is implemented; Linux support is planned (see [extension README](extensions/screenshot/README.md)).
+
 ## Development
 
 ```bash
@@ -293,6 +327,7 @@ pi -e ./extensions/handoff.ts
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/benchmark.ts
 pi -e ./extensions/context-size.ts
+pi -e ./extensions/screenshot
 ```
 
 ## License
