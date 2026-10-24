@@ -528,6 +528,10 @@ function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | und
     const promptTokens = u?.prompt_tokens ?? 0;
     const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
     const spec = m.speculative_decoding;
+    // Derive throughput from the mean inter-token latency rather than the
+    // server's `tokens_per_second`, which can be reported against a different
+    // time base (e.g. including queue time).
+    const genRate = m.mean_itl_ms != null && m.mean_itl_ms > 0 ? 1000 / m.mean_itl_ms : undefined;
     return {
       promptMs: m.time_to_first_token_ms ?? 0,
       promptN: Math.max(0, promptTokens - cached),
@@ -535,7 +539,7 @@ function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTimings | und
       predictedN: u?.completion_tokens ?? 0,
       draftN: spec?.num_draft_tokens ?? 0,
       draftAccepted: spec?.num_accepted_draft_tokens ?? 0,
-      ...(m.tokens_per_second != null ? { genRate: m.tokens_per_second } : {}),
+      ...(genRate != null && Number.isFinite(genRate) ? { genRate } : {}),
     };
   }
 
