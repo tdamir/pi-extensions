@@ -324,7 +324,7 @@ Windows is implemented; Linux support is planned (see [extension README](extensi
 npm install
 
 # Run a single extension locally without installing
-pi -e ./extensions/llama-swap.ts
+pi -e ./extensions/llama-swap
 pi -e ./extensions/handoff.ts
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/benchmark.ts
