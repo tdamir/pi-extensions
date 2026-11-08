@@ -10,6 +10,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs |
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
+| [vision](#vision) | `analyze_image` tool that answers questions about image files with a vision model, keeping images out of the conversation so request bodies stay small |
 
 ## Installation
 
@@ -317,6 +318,60 @@ Or capture manually:
 
 Windows is implemented; Linux support is planned (see [extension README](extensions/screenshot/README.md)).
 
+## vision
+
+Answers questions about image files with a vision model while keeping the image out of the conversation.
+
+### The problem it solves
+
+Every image that reaches the session (a screenshot tool result, `read` on a PNG, a browser automation capture) is embedded in the transcript and re-sent with every subsequent request. In long sessions — benchmarks that verify rendered pages, browser-driven testing — request bodies can grow past engine limits (TensorFold rejects bodies over 32 MB, and the limit is not configurable).
+
+`analyze_image` breaks that coupling: the model passes a file path and a question, the tool runs a **separate, one-off model call** with the image, and only the text answer enters the conversation. The image never touches the transcript.
+
+### Features
+
+- **`analyze_image` tool** — `path` + `question` (+ optional `maxWidth`/`maxHeight`, defaults 1600×2000) → text answer. Images are resized with pi's built-in Photon pipeline (dimension and byte limits, cheapest of PNG/JPEG) before they are sent
+- **Session model by default** — uses the model currently selected in the session when it accepts image input, so a benchmarked model judges its own output
+- **Fallback judge model** — when the session model cannot see images (e.g. text-only coder models), configure a dedicated analysis model once and every run uses it:
+
+```json
+{
+  "vision": {
+    "analyzeModel": "gx10/qwen3-vl-8b"
+  }
+}
+```
+
+A fixed judge model also keeps comparisons consistent across benchmark runs.
+
+- **Usage accounting** — the nested model call's token usage is reported on the tool result, so session totals stay accurate
+
+### Recommended benchmark setup
+
+Combine the tool with pi's built-in `images.blockImages` setting, which replaces every image in the transcript with an "Image reading is disabled." placeholder before the request is sent. With both enabled, request bodies stay small by construction, while the agent can still inspect any image on demand:
+
+```json
+{
+  "images": {
+    "blockImages": true
+  }
+}
+```
+
+Set it in `.pi/settings.json` (project scope) so only benchmark workspaces are affected. The `/benchmark` task template already tells the agent to use `analyze_image` for visual checks.
+
+### Usage examples
+
+```
+Analyze the screenshot at final/login-page.png — does the form render correctly? List any layout issues.
+Use analyze_image on workspace/preview.png and tell me whether the chart axis labels overlap.
+```
+
+### Trade-offs
+
+- The model cannot refer back to the image in later turns — each check is a fresh call, so ask focused questions (answers are text, so they compact well)
+- Each call costs tokens on the analysis model (reported in the tool result usage)
+
 ## Development
 
 ```bash
@@ -330,6 +385,7 @@ pi -e ./extensions/session-name.ts
 pi -e ./extensions/benchmark.ts
 pi -e ./extensions/context-size.ts
 pi -e ./extensions/screenshot
+pi -e ./extensions/vision
 ```
 
 ## License

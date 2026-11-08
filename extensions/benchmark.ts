@@ -124,6 +124,7 @@ export default function (pi: ExtensionAPI) {
 - If you need to create helper scripts or other files needed for completing the task, put them in ${workspaceDir} folder.
 - Put ALL final deliverables in ${finalDir} folder.
 - Do not create or modify anything outside this working directory.
+- When you need to check what an image (screenshot, rendered page) shows, use the analyze_image tool with the file path and a specific question. It answers with text and keeps the image out of the conversation, so request bodies stay small.
 
 ## Skills
 - Use browser-tools skill for debugging and testing, but do not use it to browse the web.

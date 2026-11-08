@@ -3,6 +3,33 @@
  * entry to a pi ProviderModelConfig.
  */
 
+/**
+ * Output-token ceiling used for every discovered model.
+ *
+ * `maxTokens` is the *reply* cap sent as `max_tokens`, not the context window.
+ * llama.cpp rejects a request when `prompt + max_tokens > n_ctx`, and pi-ai's
+ * clamp (`contextWindow - estimate - 4096`) relies on a ~3.5 chars/token
+ * estimate that routinely under-counts tool schemas and JSON/code by 20-30%.
+ * Capping the reply at a fixed size leaves enough headroom that estimation
+ * error is unlikely to push the request over the context window.
+ *
+ * Trade-off: the larger the cap, the earlier overflow can strike. A request
+ * overflows once the real prompt exceeds `n_ctx - maxTokens` (the clamp only
+ * trims `max_tokens` down to `n_ctx - estimate - 4096`, and the estimate can
+ * under-count by 20-30%). At 128000 that boundary sits ~12% below the context
+ * window, which is *before* pi's default compaction trigger
+ * (`contextWindow - reserveTokens`, reserveTokens 16384). If you rely on very
+ * long replies, raise the reserve so compaction fires first, e.g. in
+ * settings.json:
+ *   "compaction": { "modelOverrides": { "<provider>/<model>": { "reserveTokens": 131072 } } }
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 128000;
+
+/** Reply cap for a model: half the window, never above DEFAULT_MAX_OUTPUT_TOKENS. */
+function outputCapFor(contextWindow: number): number {
+  return Math.min(DEFAULT_MAX_OUTPUT_TOKENS, Math.floor(contextWindow / 2));
+}
+
 /** Pi thinking levels. */
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
@@ -75,7 +102,8 @@ export function mapModel(entry: SwapModelEntry): SwapModel {
     input: inferInputTypes(capabilities, entry.architecture),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: entry.context_length ?? 128000,
-    maxTokens: entry.context_length ?? 128000,
+    // Reply cap, NOT the context window: prompt + max_tokens must fit in n_ctx.
+    maxTokens: outputCapFor(entry.context_length ?? 128000),
     // Effort is baked into the model name: pin the thinking level to the
     // suffix value and hide all other levels.
     ...(suffix
