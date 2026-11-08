@@ -12,9 +12,13 @@
     "screen-capture",
     "vision",
     "analyze-image",
-    "image-analysis"
+    "image-analysis",
+    "delegate",
+    "subagent",
+    "parallel-tasks",
+    "context-isolation"
   ],
-  "description": "A collection of pi extensions: llama-swap LLM provider and handoff (transfer context to a new focused session)",
+  "description": "A collection of pi extensions: llama-swap LLM provider, delegate (parallel isolated-context workers), and more",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },

@@ -11,6 +11,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
 | [vision](#vision) | `analyze_image` tool that answers questions about image files with a vision model, keeping images out of the conversation so request bodies stay small |
+| [delegate](#delegate) | `delegate` tool that runs self-contained tasks in parallel pi worker processes with isolated context windows — only each worker's final answer returns to the main session |
 
 ## Installation
 
@@ -372,6 +373,37 @@ Use analyze_image on workspace/preview.png and tell me whether the chart axis la
 - The model cannot refer back to the image in later turns — each check is a fresh call, so ask focused questions (answers are text, so they compact well)
 - Each call costs tokens on the analysis model (reported in the tool result usage)
 
+## delegate
+
+`delegate` tool: hands self-contained tasks to fresh pi worker processes that run **in parallel** with **isolated context windows**. There are no agent definitions — every worker is a general-purpose pi instance with the default toolset.
+
+Why not just do the work inline?
+
+- **Parallelism** — independent subtasks run concurrently (up to 4 at a time, max 6 per call)
+- **Context isolation** — verbose intermediate work (wide searches, reading many files, long logs) happens in the worker's throwaway context; only each worker's final answer returns to the main session
+
+Each task spawns a `pi --mode json -p --no-session` subprocess (reusing the exact pi runtime and entry script of the running session) and streams its JSON events. Per-task output is capped at 50 KB so one noisy worker cannot flood the main context; full output stays in the tool details. Optionally pin a cheaper model per task (e.g. mechanical search on a small local llama-swap model) — tasks without a model inherit the session's model and thinking level. Ctrl+C kills all running workers.
+
+### Usage
+
+The main agent calls the tool itself; just ask naturally:
+
+```
+Review error handling in src/api/ and src/jobs/ in parallel
+Find all places that call parseFrontmatter without polluting our conversation
+```
+
+### When to delegate
+
+**Good fits:** several independent subtasks that can run at the same time; a single task that would flood the conversation with intermediate output; mechanical work for a cheaper pinned model.
+
+**Bad fits:** tasks that depend on each other's results (do them sequentially); trivial one-step lookups (spawning a process costs more than it saves).
+
+### Trade-offs
+
+- Workers cannot see the main conversation — each task must be fully self-contained (paths, files, expected output format)
+- Each worker pays its own prompt-processing cost (no shared cache with the main session); summarized in the tool result
+
 ## Development
 
 ```bash
@@ -386,6 +418,7 @@ pi -e ./extensions/benchmark.ts
 pi -e ./extensions/context-size.ts
 pi -e ./extensions/screenshot
 pi -e ./extensions/vision
+pi -e ./extensions/delegate
 ```
 
 ## License

@@ -15,11 +15,15 @@
  *
  * If the requirement is a path to an existing file, the file's content is used as
  * the requirement instead (so the same task file can be shared across model runs).
+ * Any text after the file path is treated as additional instructions and appended
+ * to the task (e.g. "do the task in parallel mode").
  *
  * Usage:
  *   /benchmark build a python CLI that converts csv to json
  *   /benchmark tasks/csv-to-cli.md
  *   /benchmark @tasks/csv-to-cli.md
+ *   /benchmark @tasks/csv-to-cli.md do the task in parallel mode
+ *   /benchmark @tasks/csv-to-cli.md -- prefer node, keep dependencies minimal
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -53,13 +57,25 @@ export default function (pi: ExtensionAPI) {
 			"Benchmark the current model: /benchmark <requirement or file with the requirement> - creates benchmarks/<model>/ with workspace/ and final/, then starts the task in this session",
 		handler: async (args, ctx) => {
 			// Support an "@"-prefixed file reference, e.g. /benchmark @tasks/csv-to-cli.md
-			let requirement = (args?.trim() ?? "").replace(/^@/, "");
-			if (!requirement) {
-				ctx.ui.notify("Usage: /benchmark <requirement to build, or a file containing it>", "error");
+			// Anything after the file path is treated as additional instructions, e.g.
+			// /benchmark @tasks/csv-to-cli.md do the task in parallel mode
+			let argText = (args?.trim() ?? "").replace(/^@/, "");
+			if (!argText) {
+				ctx.ui.notify("Usage: /benchmark <requirement to build, or a file containing it> [additional instructions]", "error");
 				return;
 			}
 
-			// If the argument is an existing file, expand it: use the file's content as the requirement
+			// Split off a leading file path token (up to the first whitespace) from the rest
+			const ws = argText.search(/\s/);
+			const firstToken = ws === -1 ? argText : argText.slice(0, ws);
+			let additionalInstructions = ws === -1 ? "" : argText.slice(ws + 1).trim();
+			// Optional "--" separator before the instructions, e.g. @file.md -- instructions
+			if (additionalInstructions.startsWith("--")) {
+				additionalInstructions = additionalInstructions.replace(/^--+\s*/, "").trim();
+			}
+
+			// If the first token is an existing file, expand it: use the file's content as the requirement
+			let requirement = firstToken;
 			let requirementSource: string | undefined;
 			const maybeFile = resolve(ctx.cwd, requirement);
 			if (existsSync(maybeFile) && statSync(maybeFile).isFile()) {
@@ -71,6 +87,13 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Failed to read ${maybeFile}: ${err instanceof Error ? err.message : String(err)}`, "error");
 					return;
 				}
+				if (additionalInstructions) {
+					requirement += `\n\n## Additional instructions\n\n${additionalInstructions}`;
+				}
+			} else {
+				// Not a file: treat the whole argument (including any "instructions" text) as the requirement
+				requirement = argText;
+				additionalInstructions = "";
 			}
 			if (!requirement) {
 				ctx.ui.notify("Requirement is empty", "error");
