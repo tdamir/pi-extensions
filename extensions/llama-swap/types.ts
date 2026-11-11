@@ -1,101 +1,19 @@
 /**
- * Raw telemetry shapes captured from llama-swap SSE responses.
+ * Shared record shapes for telemetry captured from llama-swap SSE responses.
  *
- * Each engine (llama.cpp, vLLM, tensorfold) reports a different subset:
- * - llama.cpp: `usage` + `timings`
- * - vLLM: `usage` + `metrics`
- * - tensorfold: `usage` + `tensorfold` + `speculative` + `exact_mode`
+ * This file is engine-agnostic: engine-specific telemetry is stored in
+ * `engineData`, keyed by engine id, and only the engine's adapter knows how
+ * to interpret it (see `engines/`). Only the OpenAI-protocol `usage` shape —
+ * shared by every engine — is declared here.
  */
 
+/** OpenAI-standard token usage; every engine's final chunk carries one. */
 export interface LlamaUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number; created_cache_tokens?: number };
   completion_tokens_details?: { reasoning_tokens?: number };
-  [key: string]: unknown;
-}
-
-export interface LlamaTimings {
-  cache_n?: number;
-  prompt_n?: number;
-  prompt_ms?: number;
-  prompt_per_token_ms?: number;
-  prompt_per_second?: number;
-  predicted_n?: number;
-  predicted_ms?: number;
-  predicted_per_token_ms?: number;
-  predicted_per_second?: number;
-  draft_n?: number;
-  draft_n_accepted?: number;
-  [key: string]: unknown;
-}
-
-/** vLLM's per-response `metrics` object (emitted on the final usage chunk). */
-export interface LlamaMetrics {
-  time_to_first_token_ms?: number;
-  generation_time_ms?: number;
-  queue_time_ms?: number;
-  mean_itl_ms?: number;
-  tokens_per_second?: number;
-  speculative_decoding?: {
-    mean_acceptance_length?: number;
-    draft_acceptance_rate?: number;
-    acceptance_histogram?: number[];
-    num_spec_steps?: number;
-    num_accepted_draft_tokens?: number;
-    num_draft_tokens?: number;
-    num_spec_tokens?: number;
-  };
-  [key: string]: unknown;
-}
-
-/**
- * tensorfold diagnostics (emitted on the final chunk, alongside `exact_mode`).
- * Times are in seconds here (unlike llama.cpp/vLLM, which use ms).
- */
-export interface TensorfoldDiagnostics {
-  /** Whether the server applied a thinking/reasoning template. */
-  enable_thinking?: boolean;
-  /** Reasoning effort the server actually used (`null` when unset/auto). */
-  reasoning_effort?: string | null;
-  /** tensorfold's internal engine name (e.g. `lanes`). */
-  engine?: string;
-  /** Generation throughput (completion tokens per decode second). */
-  tokens_per_second?: number;
-  /** Total wall time for the request, prefill included. */
-  seconds?: number;
-  /** Prefill time in seconds. */
-  prefill_seconds?: number;
-  /** Prefill batch widths used by the engine (engine-specific). */
-  prefill_widths?: number[];
-  /** Prefill batches the engine raised (engine-specific). */
-  prefill_raised?: number[];
-  /** End-to-end time to first token. */
-  time_to_first_token?: number;
-  /** Sampling mode the server applied (e.g. `exact`). */
-  sampling?: string;
-  /** Whether speculative drafting was enabled. */
-  drafts?: boolean;
-  /** Deterministic hash of the produced token sequence (exactness check). */
-  token_sha?: string;
-  /** Minimum row count the engine batched at (engine-specific). */
-  min_rows?: number;
-  [key: string]: unknown;
-}
-
-/** tensorfold speculative-decoding counters (same final chunk as `tensorfold`). */
-export interface SpeculativeDiagnostics {
-  /** Speculative rounds run. */
-  rounds?: number;
-  /** Draft tokens proposed. */
-  drafted?: number;
-  /** Draft tokens accepted. */
-  accepted?: number;
-  /** Accepted / drafted (server-provided). */
-  acceptance_rate?: number;
-  /** Mean completion tokens produced per round. */
-  tokens_per_round?: number;
   [key: string]: unknown;
 }
 
@@ -107,13 +25,12 @@ export interface LlamaSwapUsageRecord {
   model?: string;
   systemFingerprint?: string;
   usage?: LlamaUsage;
-  timings?: LlamaTimings;
-  metrics?: LlamaMetrics;
-  /** tensorfold diagnostics; also implies the timings source. */
-  tensorfold?: TensorfoldDiagnostics;
-  speculative?: SpeculativeDiagnostics;
-  /** Sampling mode echoed by tensorfold (e.g. `exact`). */
-  exactMode?: string;
+  /**
+   * Engine-specific telemetry payloads, keyed by engine id (e.g. `vllm`).
+   * Written by the engine adapters during capture; consumers must go through
+   * the adapter's typed accessor instead of reading this directly.
+   */
+  engineData?: Record<string, unknown>;
   capturedAt: number;
 }
 

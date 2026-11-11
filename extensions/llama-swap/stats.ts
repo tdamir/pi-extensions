@@ -9,7 +9,7 @@
  */
 
 import type { ContextUsage, CustomEntry, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { normalizeTimings, pickEngine } from "./engines";
+import { normalizeTimings, pickEngine, tensorfoldPayload } from "./engines";
 import { formatDuration, formatUsageSummary } from "./format";
 import type { LlamaSwapUsageRecord } from "./types";
 
@@ -110,17 +110,17 @@ export function computeStats(records: UsageRecordEntry[]): SwapLogStats {
     const engine = pickEngine(record)?.label;
     if (engine) stats.engines.add(engine);
 
-    const tf = record.tensorfold;
-    if (tf) {
+    const tf = tensorfoldPayload(record);
+    if (tf?.diagnostics) {
       stats.tfRequests += 1;
-      if ((record.exactMode ?? tf.sampling) === "exact") stats.exactRequests += 1;
-      if (tf.time_to_first_token != null) {
-        stats.ttftMs += tf.time_to_first_token * 1000;
+      if ((tf.exactMode ?? tf.diagnostics.sampling) === "exact") stats.exactRequests += 1;
+      if (tf.diagnostics.time_to_first_token != null) {
+        stats.ttftMs += tf.diagnostics.time_to_first_token * 1000;
         stats.ttftCount += 1;
       }
     }
 
-    if (record.speculative?.rounds) stats.specRounds += record.speculative.rounds;
+    if (tf?.speculative?.rounds) stats.specRounds += tf.speculative.rounds;
   }
 
   return stats;

@@ -1,27 +1,53 @@
-import type { LlamaMetrics, LlamaSwapUsageRecord, NormalizedTimings } from "../types";
-import type { EngineAdapter } from "./types";
+import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import { enginePayload, type EngineAdapter } from "./types";
 import { DASH, joinParts, line, msAsSecs, rate, speculativeLine } from "./util";
+
+/** vLLM's per-response `metrics` object (emitted on the final usage chunk). */
+export interface LlamaMetrics {
+  time_to_first_token_ms?: number;
+  generation_time_ms?: number;
+  queue_time_ms?: number;
+  mean_itl_ms?: number;
+  tokens_per_second?: number;
+  speculative_decoding?: {
+    mean_acceptance_length?: number;
+    draft_acceptance_rate?: number;
+    acceptance_histogram?: number[];
+    num_spec_steps?: number;
+    num_accepted_draft_tokens?: number;
+    num_draft_tokens?: number;
+    num_spec_tokens?: number;
+  };
+  [key: string]: unknown;
+}
+
+const ID = "vllm";
+
+/** The vLLM telemetry extracted into a record, if any. */
+export function vllmMetrics(record: LlamaSwapUsageRecord): LlamaMetrics | undefined {
+  const metrics = enginePayload<LlamaMetrics>(record, ID);
+  if (metrics) return metrics;
+  // Session logs written before `engineData` existed stored metrics top-level.
+  return (record as { metrics?: LlamaMetrics }).metrics;
+}
 
 /**
  * vLLM telemetry: the final usage chunk carries a `metrics` object with
  * timings in milliseconds and speculative-decoding counters.
  */
 export const vllmEngine: EngineAdapter = {
-  id: "vllm",
+  id: ID,
   label: "vLLM",
 
-  detect: (record) => !!record.metrics,
+  detect: (record) => !!vllmMetrics(record),
 
-  hasTelemetry: (record) => !!record.metrics,
+  hasTelemetry: (record) => !!vllmMetrics(record),
 
-  extract(chunk, record) {
-    if (chunk.metrics && typeof chunk.metrics === "object") {
-      record.metrics = chunk.metrics as LlamaMetrics;
-    }
-  },
+  extract: (chunk) =>
+    chunk.metrics && typeof chunk.metrics === "object" ? (chunk.metrics as LlamaMetrics) : undefined,
 
   normalize(record): NormalizedTimings | undefined {
-    const m = record.metrics;
+    const m = vllmMetrics(record);
     if (!m) return undefined;
 
     const u = record.usage;
@@ -46,7 +72,7 @@ export const vllmEngine: EngineAdapter = {
   tags: () => [],
 
   diagnostics(record) {
-    const m = record.metrics;
+    const m = vllmMetrics(record);
     if (!m) return [];
 
     const spec = m.speculative_decoding;

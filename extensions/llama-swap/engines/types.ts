@@ -8,6 +8,14 @@ import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
 /** A raw parsed SSE `data:` chunk, before any engine-specific shaping. */
 export type RawSseChunk = Record<string, unknown>;
 
+/**
+ * Read an engine's own payload out of a record's `engineData` map, typed by
+ * the caller. Engines store their extracted telemetry under their own id.
+ */
+export function enginePayload<T>(record: LlamaSwapUsageRecord, engineId: string): T | undefined {
+  return record.engineData?.[engineId] as T | undefined;
+}
+
 export interface EngineAdapter {
   /** Stable id, e.g. `llama.cpp`. */
   id: string;
@@ -16,12 +24,15 @@ export interface EngineAdapter {
   /** Does this record carry telemetry from this engine? */
   detect(record: LlamaSwapUsageRecord): boolean;
   /**
-   * Pull all telemetry fields this engine recognizes out of a raw SSE chunk
-   * into the accumulating record. Extraction is a union — every engine scans
-   * every chunk — so unlike `detect`, ordering does not matter here. Shared
-   * OpenAI-protocol fields belong to the `openai` fallback adapter.
+   * Pull this engine's telemetry out of a raw SSE chunk and return it as
+   * this engine's payload. The registry stores the returned payload in the
+   * record's `engineData` under this engine's id (see `extractTelemetry`),
+   * so adapters never touch the record during extraction. Extraction is a
+   * union — every engine scans every chunk — so unlike `detect`, ordering
+   * does not matter here. Engine-independent OpenAI-protocol fields are
+   * handled by the framework itself.
    */
-  extract?(chunk: RawSseChunk, record: LlamaSwapUsageRecord): void;
+  extract?(chunk: RawSseChunk): unknown;
   /** Does this record carry telemetry from this engine worth persisting? */
   hasTelemetry(record: LlamaSwapUsageRecord): boolean;
   /** Normalize engine-specific fields into the shared timing shape. */

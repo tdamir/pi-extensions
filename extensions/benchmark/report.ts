@@ -21,7 +21,7 @@ import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileS
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { toExportableSessionLines, loadExportFromFile } from "../llama-swap/export";
-import { pickEngine } from "../llama-swap/engines";
+import { pickEngine, tensorfoldPayload } from "../llama-swap/engines";
 import { collectToolStats, collectUsageRecords, computeStats } from "../llama-swap/stats";
 
 /** The durable benchmark-run marker persisted via pi.appendEntry(). */
@@ -265,8 +265,10 @@ function dashboardHtml(
 	const reqTable = stats.usageRecords.length
 		? `<details class="bench-requests"><summary>${fmtInt(stats.usageRecords.length)} LLM requests</summary><div class="bench-scrollx"><table class="bench-table"><thead><tr><th>#</th><th>time</th><th>model</th><th>engine</th><th>prompt</th><th>compl.</th><th>cached</th><th>tok/s</th><th>TTFT</th><th>rounds</th><th>accept</th></tr></thead><tbody>${stats.usageRecords
 				.map((rec, idx) => {
-					const tf = (rec.record as { tensorfold?: Record<string, number | string> }).tensorfold ?? {};
-					const spec = (rec.record as { speculative?: Record<string, number> }).speculative ?? {};					const usage = (rec.record as { usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } }).usage ?? {};
+					const tfp = tensorfoldPayload(rec.record);
+					const tf = tfp?.diagnostics ?? {};
+					const spec = tfp?.speculative ?? {};
+					const usage = rec.record.usage ?? {};
 					const cached = usage.prompt_tokens_details?.cached_tokens ?? 0;
 					const acceptRate = spec.drafted ? (spec.accepted ?? 0) / spec.drafted : undefined;
 					return `<tr>

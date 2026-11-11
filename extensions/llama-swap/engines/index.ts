@@ -6,7 +6,7 @@
  * fallback (shared protocol fields, bare-usage records) comes last.
  */
 
-import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import type { LlamaSwapUsageRecord, LlamaUsage, NormalizedTimings } from "../types";
 import { llamaCppEngine } from "./llama-cpp";
 import { openAiEngine } from "./openai";
 import { tensorfoldEngine } from "./tensorfold";
@@ -26,12 +26,33 @@ export function normalizeTimings(record: LlamaSwapUsageRecord): NormalizedTiming
 }
 
 /**
- * Merge telemetry from a raw SSE `data:` chunk into the accumulating record.
- * Every registered engine scans the chunk, so the tap needs no engine
- * knowledge — adding an adapter automatically extends it.
+ * Engine-independent OpenAI-protocol fields — the subset of a `data:` chunk
+ * every response carries regardless of engine. Written directly onto the
+ * record; engine-specific telemetry goes through the adapters instead.
+ */
+function extractProtocol(chunk: RawSseChunk, record: LlamaSwapUsageRecord): void {
+  if (typeof chunk.id === "string") record.responseId = chunk.id;
+  if (typeof chunk.model === "string") record.model = chunk.model;
+  if (typeof chunk.system_fingerprint === "string") {
+    record.systemFingerprint = chunk.system_fingerprint;
+  }
+  if (chunk.usage && typeof chunk.usage === "object") {
+    record.usage = chunk.usage as LlamaUsage;
+  }
+}
+
+/**
+ * Merge telemetry from a raw SSE `data:` chunk into the accumulating record:
+ * protocol fields first, then each adapter's returned payload, stored under
+ * that engine's id in `record.engineData`. The tap needs no engine knowledge
+ * — adding an adapter automatically extends it.
  */
 export function extractTelemetry(chunk: RawSseChunk, record: LlamaSwapUsageRecord): void {
-  for (const engine of ENGINES) engine.extract?.(chunk, record);
+  extractProtocol(chunk, record);
+  for (const engine of ENGINES) {
+    const payload = engine.extract?.(chunk);
+    if (payload !== undefined) (record.engineData ??= {})[engine.id] = payload;
+  }
 }
 
 /** Does the record carry telemetry from any engine worth persisting? */
@@ -45,3 +66,7 @@ export function diagnosticsLines(record: LlamaSwapUsageRecord): string[] {
 }
 
 export type { EngineAdapter, RawSseChunk } from "./types";
+export { enginePayload } from "./types";
+export { llamaCppTimings } from "./llama-cpp";
+export { tensorfoldPayload } from "./tensorfold";
+export { vllmMetrics } from "./vllm";

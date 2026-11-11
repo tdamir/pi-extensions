@@ -1,27 +1,49 @@
-import type { LlamaSwapUsageRecord, LlamaTimings, NormalizedTimings } from "../types";
-import type { EngineAdapter } from "./types";
+import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import { enginePayload, type EngineAdapter } from "./types";
 import { DASH, joinParts, line, msAsSecs, rate, speculativeLine } from "./util";
 
 /**
  * llama.cpp / llama-server telemetry: the final chunk carries `timings` with
  * prefill and decode durations in milliseconds, plus draft counters.
  */
+export interface LlamaTimings {
+  cache_n?: number;
+  prompt_n?: number;
+  prompt_ms?: number;
+  prompt_per_token_ms?: number;
+  prompt_per_second?: number;
+  predicted_n?: number;
+  predicted_ms?: number;
+  predicted_per_token_ms?: number;
+  predicted_per_second?: number;
+  draft_n?: number;
+  draft_n_accepted?: number;
+  [key: string]: unknown;
+}
+
+const ID = "llama.cpp";
+
+/** The llama.cpp telemetry extracted into a record, if any. */
+export function llamaCppTimings(record: LlamaSwapUsageRecord): LlamaTimings | undefined {
+  const timings = enginePayload<LlamaTimings>(record, ID);
+  if (timings) return timings;
+  // Session logs written before `engineData` existed stored timings top-level.
+  return (record as { timings?: LlamaTimings }).timings;
+}
+
 export const llamaCppEngine: EngineAdapter = {
-  id: "llama.cpp",
+  id: ID,
   label: "llama.cpp",
 
-  detect: (record) => !!record.timings,
+  detect: (record) => !!llamaCppTimings(record),
 
-  hasTelemetry: (record) => !!record.timings,
+  hasTelemetry: (record) => !!llamaCppTimings(record),
 
-  extract(chunk, record) {
-    if (chunk.timings && typeof chunk.timings === "object") {
-      record.timings = chunk.timings as LlamaTimings;
-    }
-  },
+  extract: (chunk) =>
+    chunk.timings && typeof chunk.timings === "object" ? (chunk.timings as LlamaTimings) : undefined,
 
   normalize(record): NormalizedTimings | undefined {
-    const t = record.timings;
+    const t = llamaCppTimings(record);
     if (!t) return undefined;
     return {
       promptMs: t.prompt_ms ?? 0,
@@ -38,7 +60,7 @@ export const llamaCppEngine: EngineAdapter = {
   tags: () => [],
 
   diagnostics(record) {
-    const t = record.timings;
+    const t = llamaCppTimings(record);
     if (!t) return [];
 
     const promptMs = t.prompt_ms ?? 0;
