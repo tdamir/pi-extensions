@@ -8,6 +8,8 @@
 
 import type { LlamaSwapUsageRecord } from "./types";
 
+export { hasTelemetry } from "./engines";
+
 export interface Capture {
   record?: LlamaSwapUsageRecord;
   /** Resolves as soon as a record has been published for this id. */
@@ -19,11 +21,6 @@ export interface Capture {
 const MAX_CAPTURES = 100;
 
 const captures = new Map<string, Capture>();
-
-/** Does the record carry any telemetry worth persisting? */
-export function hasTelemetry(record: LlamaSwapUsageRecord): boolean {
-  return !!(record.usage || record.timings || record.metrics || record.tensorfold || record.speculative);
-}
 
 /** Publish (or refresh) the record for a response id. */
 export function rememberCapture(record: LlamaSwapUsageRecord): void {

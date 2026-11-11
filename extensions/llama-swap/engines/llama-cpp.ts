@@ -1,4 +1,4 @@
-import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import type { LlamaSwapUsageRecord, LlamaTimings, NormalizedTimings } from "../types";
 import type { EngineAdapter } from "./types";
 import { DASH, joinParts, line, msAsSecs, rate, speculativeLine } from "./util";
 
@@ -11,6 +11,14 @@ export const llamaCppEngine: EngineAdapter = {
   label: "llama.cpp",
 
   detect: (record) => !!record.timings,
+
+  hasTelemetry: (record) => !!record.timings,
+
+  extract(chunk, record) {
+    if (chunk.timings && typeof chunk.timings === "object") {
+      record.timings = chunk.timings as LlamaTimings;
+    }
+  },
 
   normalize(record): NormalizedTimings | undefined {
     const t = record.timings;

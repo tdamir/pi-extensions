@@ -1,31 +1,13 @@
 /**
  * SSE tap: pi-ai's parser drops the raw telemetry fields, so response bodies
- * are teed — pi-ai reads one branch, this tap reads the other and extracts
- * `usage`, `timings`, `metrics`, `tensorfold`, `speculative`, `exact_mode`.
+ * are teed — pi-ai reads one branch, this tap reads the other. The tap itself
+ * is engine-agnostic: it parses `data:` chunks and lets the engine adapters
+ * (see `engines/`) pull out whatever telemetry they recognize.
  */
 
 import { hasTelemetry, rememberCapture } from "./capture";
-import type {
-  LlamaMetrics,
-  LlamaSwapUsageRecord,
-  LlamaTimings,
-  LlamaUsage,
-  SpeculativeDiagnostics,
-  TensorfoldDiagnostics,
-} from "./types";
-
-/** The subset of an SSE `data:` chunk this extension cares about. */
-interface StreamChunk {
-  id?: string;
-  model?: string;
-  system_fingerprint?: string;
-  usage?: LlamaUsage;
-  timings?: LlamaTimings;
-  metrics?: LlamaMetrics;
-  tensorfold?: TensorfoldDiagnostics;
-  speculative?: SpeculativeDiagnostics;
-  exact_mode?: string;
-}
+import { extractTelemetry } from "./engines";
+import type { LlamaSwapUsageRecord } from "./types";
 
 /** Best-effort parse of a teed SSE branch to extract usage/timings. */
 function tapStream(body: ReadableStream<Uint8Array>): void {
@@ -37,23 +19,13 @@ function tapStream(body: ReadableStream<Uint8Array>): void {
 
     const handleData = (data: string) => {
       if (!data || data === "[DONE]") return;
-      let chunk: StreamChunk;
+      let chunk: Record<string, unknown>;
       try {
-        chunk = JSON.parse(data) as StreamChunk;
+        chunk = JSON.parse(data) as Record<string, unknown>;
       } catch {
         return;
       }
-      if (typeof chunk.id === "string") record.responseId = chunk.id;
-      if (typeof chunk.model === "string") record.model = chunk.model;
-      if (typeof chunk.system_fingerprint === "string") {
-        record.systemFingerprint = chunk.system_fingerprint;
-      }
-      if (chunk.usage && typeof chunk.usage === "object") record.usage = chunk.usage;
-      if (chunk.timings && typeof chunk.timings === "object") record.timings = chunk.timings;
-      if (chunk.metrics && typeof chunk.metrics === "object") record.metrics = chunk.metrics;
-      if (chunk.tensorfold && typeof chunk.tensorfold === "object") record.tensorfold = chunk.tensorfold;
-      if (chunk.speculative && typeof chunk.speculative === "object") record.speculative = chunk.speculative;
-      if (typeof chunk.exact_mode === "string") record.exactMode = chunk.exact_mode;
+      extractTelemetry(chunk, record);
     };
 
     try {

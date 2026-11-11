@@ -1,4 +1,9 @@
-import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import type {
+  LlamaSwapUsageRecord,
+  NormalizedTimings,
+  SpeculativeDiagnostics,
+  TensorfoldDiagnostics,
+} from "../types";
 import type { EngineAdapter } from "./types";
 import { DASH, joinParts, line, secs, speculativeLine } from "./util";
 
@@ -15,6 +20,18 @@ export const tensorfoldEngine: EngineAdapter = {
   label: LABEL,
 
   detect: (record) => !!record.tensorfold,
+
+  hasTelemetry: (record) => !!(record.tensorfold || record.speculative || record.exactMode != null),
+
+  extract(chunk, record) {
+    if (chunk.tensorfold && typeof chunk.tensorfold === "object") {
+      record.tensorfold = chunk.tensorfold as TensorfoldDiagnostics;
+    }
+    if (chunk.speculative && typeof chunk.speculative === "object") {
+      record.speculative = chunk.speculative as SpeculativeDiagnostics;
+    }
+    if (typeof chunk.exact_mode === "string") record.exactMode = chunk.exact_mode;
+  },
 
   normalize(record): NormalizedTimings | undefined {
     const tf = record.tensorfold;

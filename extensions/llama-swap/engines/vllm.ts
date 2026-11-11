@@ -1,4 +1,4 @@
-import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
+import type { LlamaMetrics, LlamaSwapUsageRecord, NormalizedTimings } from "../types";
 import type { EngineAdapter } from "./types";
 import { DASH, joinParts, line, msAsSecs, rate, speculativeLine } from "./util";
 
@@ -11,6 +11,14 @@ export const vllmEngine: EngineAdapter = {
   label: "vLLM",
 
   detect: (record) => !!record.metrics,
+
+  hasTelemetry: (record) => !!record.metrics,
+
+  extract(chunk, record) {
+    if (chunk.metrics && typeof chunk.metrics === "object") {
+      record.metrics = chunk.metrics as LlamaMetrics;
+    }
+  },
 
   normalize(record): NormalizedTimings | undefined {
     const m = record.metrics;
