@@ -59,7 +59,7 @@ export interface TensorfoldDiagnostics {
   enable_thinking?: boolean;
   /** Reasoning effort the server actually used (`null` when unset/auto). */
   reasoning_effort?: string | null;
-  /** Engine that served the request (e.g. `lanes`). */
+  /** tensorfold's internal engine name (e.g. `lanes`). */
   engine?: string;
   /** Generation throughput (completion tokens per decode second). */
   tokens_per_second?: number;

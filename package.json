@@ -13,12 +13,11 @@
     "vision",
     "analyze-image",
     "image-analysis",
-    "delegate",
-    "subagent",
-    "parallel-tasks",
-    "context-isolation"
+    "headless-browser",
+    "puppeteer",
+    "browser-automation"
   ],
-  "description": "A collection of pi extensions: llama-swap LLM provider, delegate (parallel isolated-context workers), and more",
+  "description": "A collection of pi extensions: llama-swap LLM provider, screenshot/vision tools, and more",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -45,6 +44,9 @@
     "themes": [
       "./themes"
     ]
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.16.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

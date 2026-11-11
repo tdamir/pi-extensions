@@ -10,7 +10,7 @@ import type { LlamaSwapUsageRecord } from "./types";
 export function formatUsageSummary(record: LlamaSwapUsageRecord): string {
   const parts: string[] = [];
 
-  // Engine tags first, e.g. `lanes/exact`.
+  // Engine tags first, e.g. `tensorfold/exact`.
   const tags = pickEngine(record)?.tags(record) ?? [];
   if (tags.length > 0) parts.push(tags.join("/"));
 

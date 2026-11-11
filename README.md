@@ -7,11 +7,11 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [llama-swap provider](#llama-swap-provider) | Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider with model auto-discovery |
 | [handoff](#handoff) | Transfers context to a new focused session instead of a lossy compaction (full or compacted mode) |
 | [session-name](#session-name) | Auto-generates a session name from the conversation (fresh excerpt or full cached session), or set it manually |
-| [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs |
+| [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs, with an auto-generated HTML report (stats + chat) |
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
 | [vision](#vision) | `analyze_image` tool that answers questions about image files with a vision model, keeping images out of the conversation so request bodies stay small |
-| [delegate](#delegate) | `delegate` tool that runs self-contained tasks in parallel pi worker processes with isolated context windows — only each worker's final answer returns to the main session |
+| [headless-browser skill](#headless-browser-skill) | Skill with scripts to run headless Chrome/Edge via puppeteer-core — page screenshots, JS evaluation, and scripted UI interactions without downloading a browser |
 
 ## Installation
 
@@ -126,10 +126,10 @@ In the TUI, each entry renders as a dimmed one-liner, e.g.:
 
 ```
 ⚡ llama-swap prompt 420 tok/s · gen 28.4 tok/s · draft 12/20 · 512→384 tok (256 cached)
-⚡ llama-swap [gx10] lanes/exact · prompt 1674 tok/s · gen 77.5 tok/s · draft 94/148 (64%) · 2.9s · 6081→132 tok (4096 cached)
+⚡ llama-swap [gx10] tensorfold/exact · prompt 1674 tok/s · gen 77.5 tok/s · draft 94/148 (64%) · 2.9s · 6081→132 tok (4096 cached)
 ```
 
-With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx10] …`. tensorfold responses additionally show an `engine/sampling` tag (e.g. `lanes/exact`).
+With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx10] …`. tensorfold responses additionally show an `engine/sampling` tag (e.g. `tensorfold/exact`); tensorfold's internal engine name (e.g. `lanes`) appears in the expanded diagnostics.
 
 - **prompt tok/s** — prompt processing speed
 - **gen tok/s** — generation speed
@@ -138,7 +138,9 @@ With multiple servers, the serving provider is tagged, e.g. `⚡ llama-swap [gx1
 
 Press the expand key on the entry to see the full raw `usage`/`timings`/`metrics`/`tensorfold` JSON. tensorfold records also get a formatted diagnostics block above the JSON (engine, thinking/effort, sampling mode and `token_sha`, TTFT/prefill/decode/total times, prefill widths and raised batches, and speculative rounds). Captured records also persist in the session file, so the stats survive across sessions.
 
-Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, average TTFT, draft acceptance and speculative rounds, engine and exact-mode counts, and the five most recent requests). The panel is computed from the session log, so it works across reloads and resumed sessions. With multiple servers, the panel groups the stats per provider and tags the recent requests with the serving provider.
+Run `/swap-stats` to toggle a panel above the editor with aggregate stats across every captured turn in the current session (request count, total and cached tokens, prompt/generation throughput, average TTFT, draft acceptance and speculative rounds, engine and exact-mode counts, and the five most recent requests). It also shows a tool-calls section: total calls and failures, malformed model arguments, total tool execution time, per-tool call counts (with failure counts), skills used (detected from successful `read` calls on `SKILL.md` / skill files, counted per skill), the slowest calls, and nested (codemode) call counts. The panel is computed from the session log, so it works across reloads and resumed sessions. With multiple servers, the panel groups the stats per provider and tags the recent requests with the serving provider.
+
+The panel has two modes: the default **compact** view merges related facts into a few rows so it always fits pi's 10-line widget budget (pi truncates plain-text widgets beyond 10 lines with a "... (widget truncated)" marker), and **`/swap-stats full`** renders the complete report as a custom component — no line cap, with long rows word-wrapped at the terminal width. Re-running the command (or switching modes with the same invocation) hides the panel.
 
 ### Exporting the session to HTML
 
@@ -247,7 +249,10 @@ Each run creates a working directory named after the model (and its active think
 benchmarks/<provider>_<model>[@<thinking>]/
 ├── task.md            # the requirement plus run metadata (model, timestamp)
 ├── workspace/         # intermediate work files while building
-└── final/             # final deliverables
+├── final/             # final deliverables
+├── summary.md         # execution summary, auto-written when the task ends
+├── session-*.jsonl    # copy of the pi session file - the single source of truth for the report
+└── report.html        # HTML report (dashboard + chat), auto-written when the task ends
 ```
 
 If the directory already exists (e.g. from an earlier run), a timestamp suffix is appended so runs never collide. The current session is renamed to `<task> - <provider>/<model>[@ <thinking>]` before the run starts, so benchmark sessions are easy to spot in the session selector.
@@ -268,6 +273,21 @@ Examples:
 ```
 
 To benchmark several models, select each model (`Ctrl+P` / `/model`) and run `/benchmark` with the same requirement — then compare the `final/` folders of the per-model directories.
+
+When the task finishes (the agent run ends), the extension writes `summary.md` into the run's directory: model, start/end timestamps, wall-clock duration, outcome (`completed` / `aborted` / `error`), the same llama-swap stats the `/swap-stats` command shows (including the tool-calls and skills sections), and a pi-style session section (message counts, input/cached/uncached/output/total tokens, final context usage, cost). Everything except the session identity (name/file/id) is scoped to that run only, so multiple benchmark runs can share one session without polluting each other's summaries.
+
+Alongside the summary it also writes:
+
+- `session-*.jsonl` — a copy of the pi session file (chat transcript plus all persisted stats: tool calls, llama-swap usage entries, the benchmark run marker). It is the single source of truth for the report — there is no separate results.json
+- `report.html` — the chat rendered with pi's built-in session exporter (the same path as `/export-with-stats`, so ⚡ llama-swap per-request lines are visible), with a benchmark dashboard injected at the top: run header with outcome badge and links to all artifacts, stat cards (duration, tool calls, tokens, throughput, cache hit rate, draft acceptance, context usage — the context window comes from the run marker, captured from the model metadata when the run ends), a per-tool breakdown with time-share bars and skills-used chips, a llama-swap engine panel, and a collapsible per-request table. All stats are computed from the session copy, scoped to the run's time window; all styling is scoped to the injected section so exporter theme changes can't collide
+
+To (re)generate the HTML report — e.g. for older runs made before the report existed — use:
+
+```
+/benchmark-report [workDir]
+```
+
+Without an argument it prefers the current session's own benchmark run (read from its persisted run marker), falling back to the most recent run under `./benchmarks/`.
 
 ## context-size
 
@@ -331,7 +351,8 @@ Every image that reaches the session (a screenshot tool result, `read` on a PNG,
 
 ### Features
 
-- **`analyze_image` tool** — `path` + `question` (+ optional `maxWidth`/`maxHeight`, defaults 1600×2000) → text answer. Images are resized with pi's built-in Photon pipeline (dimension and byte limits, cheapest of PNG/JPEG) before they are sent
+- **`analyze_image` tool** — `path` (or `paths` for multiple images, max 10) + `question` (+ optional `maxWidth`/`maxHeight`, defaults 1600×2000) → text answer. Images are resized with pi's built-in Photon pipeline (dimension and byte limits, cheapest of PNG/JPEG) before they are sent
+- **Multi-image analysis** — pass several files in `paths` to analyze them together in one call (e.g. compare before/after screenshots); they are labelled "Image 1 of N", "Image 2 of N", ... so the model can attribute observations to the right image
 - **Session model by default** — uses the model currently selected in the session when it accepts image input, so a benchmarked model judges its own output
 - **Fallback judge model** — when the session model cannot see images (e.g. text-only coder models), configure a dedicated analysis model once and every run uses it:
 
@@ -366,6 +387,7 @@ Set it in `.pi/settings.json` (project scope) so only benchmark workspaces are a
 ```
 Analyze the screenshot at final/login-page.png — does the form render correctly? List any layout issues.
 Use analyze_image on workspace/preview.png and tell me whether the chart axis labels overlap.
+Compare final/before.png and final/after.png with analyze_image — what changed between the two renders?
 ```
 
 ### Trade-offs
@@ -373,36 +395,19 @@ Use analyze_image on workspace/preview.png and tell me whether the chart axis la
 - The model cannot refer back to the image in later turns — each check is a fresh call, so ask focused questions (answers are text, so they compact well)
 - Each call costs tokens on the analysis model (reported in the tool result usage)
 
-## delegate
+## headless-browser skill
 
-`delegate` tool: hands self-contained tasks to fresh pi worker processes that run **in parallel** with **isolated context windows**. There are no agent definitions — every worker is a general-purpose pi instance with the default toolset.
+A [skill](https://github.com/earendil-works/pi/blob/main/docs/skills.md) (in `skills/headless-browser/`) that lets the agent drive headless Chrome/Edge via `puppeteer-core` — no browser download, auto-detects an installed Chrome → Edge → chromium (override with `CHROME_PATH`).
 
-Why not just do the work inline?
+### Tools
 
-- **Parallelism** — independent subtasks run concurrently (up to 4 at a time, max 6 per call)
-- **Context isolation** — verbose intermediate work (wide searches, reading many files, long logs) happens in the worker's throwaway context; only each worker's final answer returns to the main session
+- **`scripts/shot.js <url|file>`** — screenshot a page (`--out`, `--width/--height`, `--full`, `--waitfor`, `--wait`), printing any page/console/network errors; WebGL works headless (SwiftShader)
+- **`scripts/eval.js <url|file> --js "<expr>"`** — evaluate JS in the page (awaited, so async works) and print the JSON result; `--jsfile` for longer probes
+- **`scripts/interact.js <url|file> --script actions.json`** — scripted UI flows from a JSON action list: `click`, `clickText`, `type`, `keys`, `scroll`, mouse drag, `eval`, `screenshot`, waits — with a final screenshot and error report
 
-Each task spawns a `pi --mode json -p --no-session` subprocess (reusing the exact pi runtime and entry script of the running session) and streams its JSON events. Per-task output is capped at 50 KB so one noisy worker cannot flood the main context; full output stays in the tool details. Optionally pin a cheaper model per task (e.g. mechanical search on a small local llama-swap model) — tasks without a model inherit the session's model and thinking level. Ctrl+C kills all running workers.
+`scripts/lib.js` exposes `launch(opts)` and `watchErrors(page, bag)` for one-off custom scripts. See `skills/headless-browser/SKILL.md` for full usage.
 
-### Usage
-
-The main agent calls the tool itself; just ask naturally:
-
-```
-Review error handling in src/api/ and src/jobs/ in parallel
-Find all places that call parseFrontmatter without polluting our conversation
-```
-
-### When to delegate
-
-**Good fits:** several independent subtasks that can run at the same time; a single task that would flood the conversation with intermediate output; mechanical work for a cheaper pinned model.
-
-**Bad fits:** tasks that depend on each other's results (do them sequentially); trivial one-step lookups (spawning a process costs more than it saves).
-
-### Trade-offs
-
-- Workers cannot see the main conversation — each task must be fully self-contained (paths, files, expected output format)
-- Each worker pays its own prompt-processing cost (no shared cache with the main session); summarized in the tool result
+> **Note:** `puppeteer-core` is declared in this package's `dependencies`, so `pi install` installs it at the package root; the scripts resolve it through the normal Node lookup. If you copy the skill directory somewhere else standalone, run `npm install` inside it.
 
 ## Development
 
@@ -418,7 +423,6 @@ pi -e ./extensions/benchmark.ts
 pi -e ./extensions/context-size.ts
 pi -e ./extensions/screenshot
 pi -e ./extensions/vision
-pi -e ./extensions/delegate
 ```
 
 ## License

@@ -57,8 +57,8 @@ export function toExportableSessionLines(lines: string[]): string[] {
 
 type ExportFromFile = (input: string, options?: { outputPath?: string }) => Promise<string>;
 
-/** Locate and load the built-in standalone HTML exporter (not exported from the package root). */
-async function loadExportFromFile(): Promise<ExportFromFile> {
+/** Locate and load the built-in standalone HTML exporter (not exported from the package root). Used by /export-with-stats and the benchmark report. */
+export async function loadExportFromFile(): Promise<ExportFromFile> {
   const pkgDir = getPackageDir();
   const candidates = [
     join(pkgDir, "dist", "core", "export-html", "index.js"),

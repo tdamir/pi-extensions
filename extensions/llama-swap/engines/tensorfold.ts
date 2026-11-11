@@ -2,6 +2,9 @@ import type { LlamaSwapUsageRecord, NormalizedTimings } from "../types";
 import type { EngineAdapter } from "./types";
 import { DASH, joinParts, line, secs, speculativeLine } from "./util";
 
+/** Adapter label, also used as the summary tag (see `tags`). */
+const LABEL = "tensorfold";
+
 /**
  * tensorfold telemetry: `tensorfold` diagnostics plus `speculative` counters
  * and the `exact_mode` echo, all on the final chunk. Times are in seconds
@@ -9,7 +12,7 @@ import { DASH, joinParts, line, secs, speculativeLine } from "./util";
  */
 export const tensorfoldEngine: EngineAdapter = {
   id: "tensorfold",
-  label: "tensorfold",
+  label: LABEL,
 
   detect: (record) => !!record.tensorfold,
 
@@ -38,8 +41,10 @@ export const tensorfoldEngine: EngineAdapter = {
   tags(record) {
     const tf = record.tensorfold;
     if (!tf) return [];
-    // Tag the engine and sampling mode first, e.g. `lanes/exact`.
-    return [tf.engine, record.exactMode ?? tf.sampling].filter((tag): tag is string => !!tag);
+    // Tag the adapter and sampling mode first, e.g. `tensorfold/exact`.
+    // `tf.engine` is tensorfold's internal engine name (`lanes`), constant
+    // across requests, so it belongs in the expanded diagnostics, not here.
+    return [LABEL, record.exactMode ?? tf.sampling].filter((tag): tag is string => !!tag);
   },
 
   diagnostics(record) {
@@ -51,6 +56,7 @@ export const tensorfoldEngine: EngineAdapter = {
         ? Math.max(0, tf.seconds - tf.prefill_seconds)
         : undefined;
     const engine = joinParts(
+      LABEL,
       tf.engine ?? DASH,
       tf.drafts != null ? `drafts ${tf.drafts ? "on" : "off"}` : undefined,
       tf.min_rows != null ? `min_rows ${tf.min_rows}` : undefined,
