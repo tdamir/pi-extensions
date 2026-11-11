@@ -1,14 +1,14 @@
 /**
- * Aggregate stats over `llama-swap-usage` session entries, the
- * `/swap-stats` panel (compact + full views), and the shared plain-text
- * report builder used by the benchmark extension's execution summary files.
+ * Aggregate stats over `llama-swap-usage` session entries and the shared
+ * plain-text report builders used by the /swap-stats panel
+ * (./commands/swap-stats.ts) and the benchmark extension's execution summary
+ * files.
  *
  * Because the data comes from the session log, the panel works across
  * reloads and resumed sessions.
  */
 
-import type { ContextUsage, CustomEntry, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import type { ContextUsage, CustomEntry, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { normalizeTimings, pickEngine } from "./engines";
 import { formatDuration, formatUsageSummary } from "./format";
 import type { LlamaSwapUsageRecord } from "./types";
@@ -711,70 +711,4 @@ export function buildCompactStatsReport(
   }
 
   return lines;
-}
-
-/**
- * Command: /swap-stats — toggles a panel above the editor with aggregate
- * llama-swap stats computed from the session log (survives restarts/reloads).
- *
- * Default (compact) view merges related facts into few rows so it fits pi's
- * 10-line string-widget budget instead of rendering "... (widget truncated)".
- * `/swap-stats full` shows the complete report as a custom component, which
- * bypasses the line cap (Text components word-wrap at the terminal width).
- */
-export function registerSwapStatsCommand(pi: ExtensionAPI): void {
-  type PanelMode = "compact" | "full";
-  let visible = false;
-  let mode: PanelMode = "compact";
-  const WIDGET_KEY = "llama-swap-stats";
-
-  const hide = (ui: { setWidget(key: string, content?: unknown): void }) => {
-    if (!visible) return;
-    visible = false;
-    ui.setWidget(WIDGET_KEY, undefined);
-  };
-
-  pi.on("session_shutdown", (_event, ctx) => hide(ctx.ui));
-
-  pi.registerCommand("swap-stats", {
-    description:
-      "Show aggregate llama-swap stats from the session log (toggles the panel). Modes: compact (default, fits the widget) | full (all rows, no truncation)",
-    handler: async (args, ctx) => {
-      const arg = (args ?? "").trim().toLowerCase();
-      const requested: PanelMode = arg === "full" || arg === "all" ? "full" : "compact";
-      if (visible && requested === mode) {
-        hide(ctx.ui);
-        ctx.ui.notify("llama-swap stats panel hidden.", "info");
-        return;
-      }
-
-      const records = collectUsageRecords(ctx.sessionManager.getEntries());
-      const tools = collectToolStats(ctx.sessionManager.getEntries());
-      if (records.length === 0 && tools.calls === 0) {
-        ctx.ui.notify("No llama-swap usage entries in this session yet.", "info");
-        return;
-      }
-
-      const theme = ctx.ui.theme;
-      const paint: StatsPaint = {
-        bold: (text) => theme.bold(text),
-        dim: (text) => theme.fg("dim", text),
-      };
-
-      mode = requested;
-      if (mode === "full") {
-        // Custom component: not subject to the 10-line string-widget cap; the
-        // Text components word-wrap long rows at the terminal width.
-        const lines = buildStatsReport(records, paint, undefined, tools);
-        ctx.ui.setWidget(WIDGET_KEY, () => {
-          const container = new Container();
-          for (const line of lines) container.addChild(new Text(line, 1, 0));
-          return container;
-        });
-      } else {
-        ctx.ui.setWidget(WIDGET_KEY, buildCompactStatsReport(records, paint, undefined, tools));
-      }
-      visible = true;
-    },
-  });
 }

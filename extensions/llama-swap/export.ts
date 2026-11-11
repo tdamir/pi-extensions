@@ -8,14 +8,18 @@
  * exporter, which renders those as visible hook messages.
  */
 
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { formatUsageSummary } from "./format";
 import type { LlamaSwapUsageRecord } from "./types";
+
+/**
+ * Session-entry rewriting + loader for the HTML exporter. The /export-with-stats
+ * command (./commands/export-with-stats.ts) and the benchmark extension both
+ * build on these; registration lives in index.ts.
+ */
 
 interface SessionEntryLike {
   type?: string;
@@ -72,43 +76,4 @@ export async function loadExportFromFile(): Promise<ExportFromFile> {
     if (typeof mod.exportFromFile === "function") return mod.exportFromFile;
   }
   throw new Error("Could not locate the pi HTML exporter (core/export-html/index.js)");
-}
-
-/** Command: /export-with-stats [file] — /export that includes llama-swap-usage entries. */
-export function registerExportCommand(pi: ExtensionAPI): void {
-  pi.registerCommand("export-with-stats", {
-    description: "Export session to HTML, including llama-swap usage stats",
-    handler: async (args, ctx) => {
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile || !existsSync(sessionFile)) {
-        ctx.ui.notify("No session file to export yet.", "error");
-        return;
-      }
-
-      const tmpFile = join(tmpdir(), `llama-swap-export-${process.pid}-${Date.now()}.jsonl`);
-      writeFileSync(
-        tmpFile,
-        toExportableSessionLines(readFileSync(sessionFile, "utf-8").split("\n")).join("\n"),
-        "utf-8",
-      );
-
-      try {
-        const exportFromFile = await loadExportFromFile();
-        const outputPath = args.trim() || `pi-session-${basename(sessionFile, ".jsonl")}.html`;
-        const out = await exportFromFile(tmpFile, { outputPath });
-        ctx.ui.notify(`Exported to: ${out}`, "info");
-      } catch (error) {
-        ctx.ui.notify(
-          `Export failed: ${error instanceof Error ? error.message : String(error)}`,
-          "error",
-        );
-      } finally {
-        try {
-          unlinkSync(tmpFile);
-        } catch {
-          // ignore
-        }
-      }
-    },
-  });
 }
