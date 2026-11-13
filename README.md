@@ -13,6 +13,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
 | [vision](#vision) | `analyze_image` tool that answers questions about image files with a vision model, keeping images out of the conversation so request bodies stay small |
 | [headless-browser skill](#headless-browser-skill) | Skill with scripts to run headless Chrome/Edge via puppeteer-core — page screenshots, JS evaluation, and scripted UI interactions without downloading a browser |
+| [terminal-app-testing skill](#terminal-app-testing-skill) | Skill for driving terminal apps (PowerShell/cmd/WSL/TUI) with keystrokes and screenshots, plus pi-specific testing: RPC command driving and a pi-tui component render harness |
 
 ## Installation
 
@@ -455,6 +456,26 @@ A [skill](https://github.com/earendil-works/pi/blob/main/docs/skills.md) (in `sk
 `scripts/lib.js` exposes `launch(opts)` and `watchErrors(page, bag)` for one-off custom scripts. See `skills/headless-browser/SKILL.md` for full usage.
 
 > **Note:** `puppeteer-core` is declared in this package's `dependencies`, so `pi install` installs it at the package root; the scripts resolve it through the normal Node lookup. If you copy the skill directory somewhere else standalone, run `npm install` inside it.
+
+## terminal-app-testing skill
+
+A [skill](https://github.com/earendil-works/pi/blob/main/docs/skills.md) (in `skills/terminal-app-testing/`) for driving terminal applications instead of guessing at them, and for testing pi extensions.
+
+**Any terminal app (Windows):**
+
+- `scripts/launch-terminal.ps1 -Command "ls" -Shell powershell` starts a PowerShell/cmd/WSL/bash session in a new Windows Terminal tab or window, injects a unique title marker, waits until the window appears, and prints `<pid> <title>`
+- `scripts/send-keys.ps1 -ProcessId <pid> -Keys "ls,{ENTER}"` sends comma-separated keystroke sequences with a delay between parts (`{ESC}`, `^u`, `{PGDN}`, …)
+- screenshot the window with the `screenshot` tool by pid, then verify with `analyze_image`
+
+That covers plain shells, SSH sessions, interactive CLIs, and full-screen TUIs (vim, htop, …).
+
+**pi extensions:**
+
+- **RPC drive** — `scripts/rpc-drive.mjs "/my-command args" -e ./extensions/my-extension.ts` runs the real session in RPC mode, waits until the command is registered (no startup race), then prints every `notify`, `setStatus`, `setWidget`, `entry_appended`, and dialog request it emits. Dialogs are answered automatically (`--dialog accept|cancel|value:<text>`, `--confirm yes|no`), so `ctx.ui.editor()` flows can be tested end to end. Exit code `0` means the command handled the prompt, `2` means it fell through to the agent (wrong or unregistered name)
+- **Render harness** — `scripts/render-harness.mjs --module ./extensions/x.ts --export MyPopup --width 80 --rows 40 --keys "down,pageDown,end"` imports the extension's `.ts` directly (Node >= 22 type stripping) and renders a component with a fake TUI and plain theme, flagging any line wider than the viewport and printing `done()` calls. Widget string arrays are capped at 10 lines by pi; a scrollable `ctx.ui.custom()` overlay is not
+- **Real TUI** — launch pi through `launch-terminal.ps1`, send keys with `send-keys.ps1`, screenshot. Needed for overlay compositing, focus, and mouse behavior
+
+See `skills/terminal-app-testing/SKILL.md` for full usage and the Git Bash path-conversion caveat.
 
 ## Development
 
