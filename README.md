@@ -7,6 +7,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [llama-swap provider](#llama-swap-provider) | Registers [llama-swap](https://github.com/mostlygeek/llama-swap) as an OpenAI-compatible LLM provider with model auto-discovery |
 | [handoff](#handoff) | Transfers context to a new focused session instead of a lossy compaction (full or compacted mode) |
 | [session-name](#session-name) | Auto-generates a session name from the conversation (fresh excerpt or full cached session), or set it manually |
+| [commit-message](#commit-message) | Suggests a commit message from the current git changes with the current model, optionally committing it (`--commit`) |
 | [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs, with an auto-generated HTML report (stats + chat) |
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
@@ -208,7 +209,22 @@ Requires interactive (TUI) mode.
 
 ## session-name
 
-Auto-generates a session name from the conversation context using the current model. The generated name is placed in the input as `/name <suggestion>` — press Enter to confirm or edit first.
+Auto-generates a session name from the conversation context using the current model. When run manually, the generated name is placed in the input as `/name <suggestion>` — press Enter to confirm or edit first. When auto-naming kicks in, the name is set immediately.
+
+### Automatic naming
+
+Auto-naming is **on by default**. Once a persisted session settles its first agent run (after the first turn, including any tool calls), the name is generated with the fresh strategy and applied directly via `pi.setSessionName()` — no Enter needed. It only runs once per session, and never overwrites a name that is already set (manual `/name`, resumed session, or an earlier auto-name). Ephemeral sessions without a session file are skipped.
+
+```
+/session-name auto            # show whether auto-naming is on
+/session-name auto on|off     # toggle it (persisted in settings.json)
+```
+
+Or set it in `~/.pi/agent/settings.json`:
+
+```json
+{ "sessionName": { "auto": false } }
+```
 
 ### Strategies
 
@@ -234,8 +250,39 @@ The picker also offers a `(default) current model` option to clear the setting. 
 /session-name full             # generate a name from the full session (cached prefix)
 /session-name "My Name"        # set the name manually
 /session-name show             # show the current session name
+/session-name auto [on | off]  # show/toggle automatic naming after the first turn
 /session-name-model [show | clear]   # configure which model generates suggestions
 ```
+
+Requires interactive (TUI) mode.
+
+## commit-message
+
+Suggests a commit message for the current git changes using the current session model.
+
+It reads the working tree — `git status`, the staged diff, the unstaged diff, the contents of untracked files (which `git diff` never shows), the branch name, and the last 10 commit subjects for style — and asks the model for a message that matches the repository's conventions (Conventional Commits only when the history uses them). Diffs are truncated, so very large changes still produce a fast request.
+
+The suggestion is shown in a **scrollable popup overlay** (so long messages are fully readable, unlike the 10-line widget limit):
+
+```
+↑↓ / PgUp / PgDn / Home / End   scroll the message
+c                               copy the message to the clipboard (OSC 52 fallback)
+m                               edit the message, then commit it
+Enter / Esc                     close
+```
+
+It is **not** written to the session file, so it does not show up in `/export`, benchmark reports, or the session JSONL. In RPC/print modes, where custom components are unavailable, the message is shown in a widget above the editor instead.
+
+### Usage
+
+```
+/commit-message                  # suggest a message for the current changes
+/commit-message --commit         # suggest, edit, then commit in one step
+/commit-message <hint>           # extra guidance, e.g. /commit-message mention the parser fix
+/commit-message --commit <hint>
+```
+
+With `--commit` the popup is skipped and the suggestion opens directly in a multi-line editor: press Enter to commit, or edit it first (Esc cancels). Either way, it commits the staged changes when something is staged; otherwise it commits all tracked changes (`git commit -a`). Untracked files are never added automatically.
 
 Requires interactive (TUI) mode.
 

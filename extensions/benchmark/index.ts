@@ -425,7 +425,6 @@ export default function (pi: ExtensionAPI) {
 - \`summary.md\` - execution summary, auto-written when the task ends
 - \`session-*.jsonl\` - copy of the pi session file, auto-written when the task ends (the single source of truth for the report)
 - \`report.html\` - HTML report (dashboard + chat, built from the session copy via pi's session exporter), auto-written when the task ends
-- \`session-*.jsonl\` - copy of the pi session file, auto-written when the task ends
 
 ## Rules
 
@@ -434,8 +433,9 @@ export default function (pi: ExtensionAPI) {
 - Put ALL final deliverables in ${finalDir} folder.
 - Do not create or modify anything outside the working folder.
 
-## Skills
+## Skills and Tools
 - Use headless-browser skill for debugging, testing and reviewing the work, but do not use it to browse the web.
+- When you need to check what an image (screenshot, rendered page) shows, use the analyze_image tool with the file path and a specific question. It answers with text and keeps the image out of the conversation, so request bodies stay small.
 
 ## Requirement
 

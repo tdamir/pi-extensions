@@ -12,9 +12,15 @@
  *   /session-name full           - Generate a name (full-session context, cached)
  *   /session-name "My Name"      - Set the session name manually
  *   /session-name show           - Show the current session name
+ *   /session-name auto [on|off]  - Show/toggle automatic naming after the first turn
  *   /session-name-model          - Pick the model used for name suggestions (saved to settings.json)
  *   /session-name-model show     - Show the configured suggestion model
  *   /session-name-model clear    - Reset to the current model
+ *
+ * Auto-naming: enabled by default. Once a persisted session has settled its first
+ * agent run (agent_settled), the name is generated and applied directly via
+ * pi.setSessionName() unless the session already has a name. Disable it with
+ * /session-name auto off, or with "sessionName": { "auto": false } in settings.json.
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -41,6 +47,9 @@ If coding, mention the key action: refactor, debug, create, migrate, etc.
 Respond with ONLY the name, nothing else.`;
 
 type Strategy = "fresh" | "full";
+
+/** How a generated name is applied: pre-filled in the editor, or set immediately. */
+type ApplyMode = "editor" | "direct";
 
 // =============================================================================
 // Searchable + scrollable model picker (fuzzy search, like the built-in /model)
@@ -224,6 +233,24 @@ function setConfiguredModelRef(ref: ModelRef | null) {
     writeSettings(raw);
 }
 
+function getAutoNaming(): boolean {
+    try {
+        const auto = (readSettings().sessionName as { auto?: unknown } | undefined)?.auto;
+        // Enabled by default; only an explicit false disables it
+        return auto !== false;
+    } catch {
+        return true;
+    }
+}
+
+function setAutoNaming(enabled: boolean) {
+    const raw = readSettings();
+    const sessionName: Record<string, unknown> = { ...(raw.sessionName as Record<string, unknown> | undefined) };
+    sessionName.auto = enabled;
+    raw.sessionName = sessionName;
+    writeSettings(raw);
+}
+
 /**
  * The model to use for name suggestions: the configured sessionName.model if
  * set and still available, otherwise the current model.
@@ -287,16 +314,17 @@ function getSessionId(ctx: any): string | undefined {
     return file ? file.replace(/[^a-zA-Z0-9_-]/g, "") : undefined;
 }
 
-async function generateName(pi: ExtensionAPI, ctx: any, strategy: Strategy) {
+/**
+ * Build the request that asks the model for a name. Returns undefined when there
+ * is nothing to name yet.
+ */
+function buildNameRequest(pi: ExtensionAPI, ctx: any, strategy: Strategy): (() => any) | undefined {
     const branch = ctx.sessionManager.getBranch();
 
     if (strategy === "full") {
         // Full strategy: send the full session so provider-side prompt caching applies
         const messages = buildMessages(branch);
-        if (messages.length === 0) {
-            ctx.ui.notify("Not enough conversation to generate a name yet", "warning");
-            return;
-        }
+        if (messages.length === 0) return undefined;
 
         // Replicate active tools so the request matches the cached conversation prefix
         const activeToolNames = pi.getActiveTools();
@@ -305,7 +333,7 @@ async function generateName(pi: ExtensionAPI, ctx: any, strategy: Strategy) {
             .filter((t) => activeToolNames.includes(t.name))
             .map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
 
-        await generateWithModel(ctx, () => ({
+        return () => ({
             systemPrompt: ctx.getSystemPrompt(),
             messages: [
                 ...messages,
@@ -317,18 +345,14 @@ async function generateName(pi: ExtensionAPI, ctx: any, strategy: Strategy) {
             ],
             tools,
             sessionId: getSessionId(ctx),
-        }));
-        return;
+        });
     }
 
     // Fresh strategy (default): short, uncached excerpt
     const conversation = buildConversationExcerpt(branch);
-    if (!conversation.trim()) {
-        ctx.ui.notify("Not enough conversation to generate a name yet", "warning");
-        return;
-    }
+    if (!conversation.trim()) return undefined;
 
-    await generateWithModel(ctx, () => ({
+    return () => ({
         messages: [
             {
                 role: "user" as const,
@@ -336,9 +360,41 @@ async function generateName(pi: ExtensionAPI, ctx: any, strategy: Strategy) {
                 timestamp: Date.now(),
             },
         ],
-    }));
+    });
 }
 
+function applyGeneratedName(
+    pi: ExtensionAPI,
+    ctx: any,
+    result: { name: string; model: { provider: string; id: string } },
+    apply: ApplyMode,
+) {
+    if (apply === "direct") {
+        pi.setSessionName(result.name);
+        ctx.ui.notify(`Session named: ${result.name}`, "info");
+        return;
+    }
+
+    ctx.ui.setEditorText(`/name ${result.name}`);
+    ctx.ui.notify(
+        `Generated name: ${result.name} (model: ${result.model.provider}/${result.model.id} — press Enter to confirm, or edit first)`,
+        "info",
+    );
+}
+
+async function generateName(pi: ExtensionAPI, ctx: any, strategy: Strategy, apply: ApplyMode = "editor") {
+    const buildRequest = buildNameRequest(pi, ctx, strategy);
+    if (!buildRequest) {
+        ctx.ui.notify("Not enough conversation to generate a name yet", "warning");
+        return;
+    }
+
+    const result = await generateWithModel(ctx, buildRequest);
+    if (!result) return;
+    applyGeneratedName(pi, ctx, result, apply);
+}
+
+/** Ask the suggestion model for a name. Returns the name plus the model that produced it. */
 async function generateWithModel(ctx: any, buildRequest: () => any) {
     if (ctx.hasUI) {
         ctx.ui.setStatus("session-name", "Generating name...");
@@ -350,19 +406,19 @@ async function generateWithModel(ctx: any, buildRequest: () => any) {
     if (!model) {
         ctx.ui.notify("No model available to generate a name", "error");
         if (ctx.hasUI) ctx.ui.setStatus("session-name", "");
-        return;
+        return undefined;
     }
 
     const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
     if (!auth.ok) {
         ctx.ui.notify(`Model error: ${auth.error}`, "warning");
         if (ctx.hasUI) ctx.ui.setStatus("session-name", "");
-        return;
+        return undefined;
     }
     if (!auth.apiKey) {
         ctx.ui.notify(`No API key for ${model.provider}/${model.id}`, "warning");
         if (ctx.hasUI) ctx.ui.setStatus("session-name", "");
-        return;
+        return undefined;
     }
 
     try {
@@ -384,29 +440,114 @@ async function generateWithModel(ctx: any, buildRequest: () => any) {
             .trim()
             .replace(/^["']|["']$/g, "");
 
-        if (name) {
-            ctx.ui.setEditorText(`/name ${name}`);
-            ctx.ui.notify(
-                `Generated name: ${name} (model: ${model.provider}/${model.id} — press Enter to confirm, or edit first)`,
-                "info",
-            );
-        } else {
+        if (!name) {
             ctx.ui.notify(`No name generated (model: ${model.provider}/${model.id})`, "warning");
+            return undefined;
         }
+        return { name, model };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         ctx.ui.notify(`Error generating name: ${msg}`, "error");
+        return undefined;
     } finally {
         if (ctx.hasUI) ctx.ui.setStatus("session-name", "");
     }
 }
 
+function hasAssistantMessage(branch: SessionEntry[]): boolean {
+    return branch.some((entry) => entry?.type === "message" && entry.message?.role === "assistant");
+}
+
+/**
+ * Session identity used to remember that auto-naming was already attempted.
+ * Undefined for ephemeral sessions (no session file), which are never auto-named.
+ */
+function getSessionKey(ctx: any): string | undefined {
+    return ctx.sessionManager.getSessionFile() ?? undefined;
+}
+
 export default function (pi: ExtensionAPI) {
+    // Auto-naming state: only try once per session, never concurrently
+    let autoAttemptedSession: string | undefined;
+    let autoInFlight = false;
+
+    pi.on("session_start", async (_event, _ctx) => {
+        // A new/loaded/forked session gets its own auto-naming attempt
+        autoAttemptedSession = undefined;
+    });
+
+    pi.on("agent_settled", async (event, ctx) => {
+        if (event.aborted) return;
+        if (!getAutoNaming()) return;
+        // Never overwrite a name that is already set (manual /name, resumed session, earlier auto-name)
+        if (pi.getSessionName()) return;
+        if (autoInFlight) return;
+
+        // Only persisted sessions are listed by name in the session selector
+        const key = getSessionKey(ctx);
+        if (!key || autoAttemptedSession === key) return;
+
+        // Wait until the conversation has something to name
+        const branch = ctx.sessionManager.getBranch();
+        if (!hasAssistantMessage(branch)) return;
+
+        autoAttemptedSession = key;
+        autoInFlight = true;
+
+        // Fire and forget so the settled notification is not blocked by the request
+        void (async () => {
+            try {
+                const buildRequest = buildNameRequest(pi, ctx, "fresh");
+                if (!buildRequest) return;
+                const result = await generateWithModel(ctx, buildRequest);
+                if (!result) return;
+                // Don't rename a session the user switched away from mid-request
+                if (getSessionKey(ctx) !== key) return;
+                applyGeneratedName(pi, ctx, result, "direct");
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                try {
+                    ctx.ui.notify(`Auto session naming failed: ${msg}`, "warning");
+                } catch {
+                    // session may be gone already; ignore
+                }
+            } finally {
+                autoInFlight = false;
+            }
+        })();
+    });
+
     pi.registerCommand("session-name", {
         description:
-            "Generate session name from conversation (/session-name, /session-name full), or set manually (/session-name \"Name\", /session-name show)",
+            "Generate session name from conversation (/session-name, /session-name full), set it manually (/session-name \"Name\"), show it (/session-name show), or toggle auto-naming (/session-name auto [on|off])",
         handler: async (args, ctx) => {
             const trimmed = args?.trim();
+            const firstToken = trimmed?.split(/\s+/)[0]?.toLowerCase();
+
+            // "auto" → show/toggle automatic naming after the first turn
+            if (firstToken === "auto") {
+                const rest = trimmed!.slice(4).trim().toLowerCase();
+                if (!rest) {
+                    ctx.ui.notify(
+                        `Auto session naming: ${getAutoNaming() ? "on" : "off"} (after the first turn)`,
+                        "info",
+                    );
+                    return;
+                }
+                if (rest !== "on" && rest !== "off") {
+                    ctx.ui.notify("Usage: /session-name auto [on | off]", "error");
+                    return;
+                }
+                const enabled = rest === "on";
+                setAutoNaming(enabled);
+                ctx.ui.notify(
+                    enabled
+                        ? "Auto session naming enabled (applied after the first turn)."
+                        : "Auto session naming disabled.",
+                    "info",
+                );
+                return;
+            }
 
             // "full" → generate using the full session (cached prefix)
             if (trimmed?.toLowerCase() === "full") {
