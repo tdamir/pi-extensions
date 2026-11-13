@@ -283,7 +283,7 @@ It is **not** written to the session file, so it does not show up in `/export`, 
 /commit-message --commit <hint>
 ```
 
-With `--commit` the popup is skipped and the suggestion opens directly in a multi-line editor: press Enter to commit, or edit it first (Esc cancels). Either way, it commits the staged changes when something is staged; otherwise it commits all tracked changes (`git commit -a`). Untracked files are never added automatically.
+With `--commit` the popup is skipped and the suggestion opens directly in a multi-line editor: press Enter to commit, or edit it first (Esc cancels). Committing stages the entire working tree first (`git add -A`), including untracked files, so the commit always contains all current changes — no partially staged commits from forgetting to `git add`.
 
 Requires interactive (TUI) mode.
 

@@ -14,9 +14,9 @@
  *
  * In the popup: ↑↓/PgUp/PgDn/Home/End scroll, c copies the message, m commits it
  * (opens the editor first), Enter/Esc closes. With --commit the popup is skipped and
- * the editor opens directly: edit if needed, press Enter to commit (staged changes
- * when something is staged, otherwise `git commit -a`), or Esc to cancel. Untracked
- * files are never added automatically.
+ * the editor opens directly: edit if needed, press Enter to commit, or Esc to cancel.
+ * Committing stages the entire working tree first (`git add -A`), including untracked
+ * files, so the commit always contains all current changes.
  */
 
 import { readFileSync } from "node:fs";
@@ -40,7 +40,7 @@ Rules:
 - Subject line: at most 72 characters, imperative mood ("add", "fix", "refactor" — not "added" or "adds"), no trailing period, no prefix like "This commit".
 - Add a body after a blank line only when the change is substantial: explain what changed and why (not how), wrapped at 72 characters, with "-" bullets when listing several things.
 - Describe what the diff actually does. Do not invent files, behavior, or intent that is not visible in the changes.
-- If unstaged changes exist alongside staged ones, describe the staged changes — they are what gets committed.
+- Committing stages the entire working tree (git add -A), so describe all the changes below: staged, unstaged, and untracked files alike.
 
 Output ONLY the commit message: no code fences, no quotes, no explanation.`;
 
@@ -62,8 +62,6 @@ interface GitContext {
 	/** Contents of untracked files, which `git diff` does not show. */
 	untracked: string;
 	log: string;
-	/** True when something is staged, i.e. a plain `git commit` commits the staged diff. */
-	hasStagedChanges: boolean;
 }
 
 /** Result of the suggestion popup: "commit" when the user asked to commit it. */
@@ -317,7 +315,6 @@ async function collectGitContext(pi: ExtensionAPI, ctx: ExtensionContext): Promi
 		untracked: readUntrackedFiles(ctx, statusText),
 		// An empty repository has no commits yet; `git log` exits non-zero there.
 		log: truncate(log.code === 0 ? log.stdout.trim() : "", MAX_LOG),
-		hasStagedChanges: stagedDiff.length > 0,
 	};
 }
 
@@ -442,15 +439,16 @@ async function generateSuggestion(
 	}
 }
 
-async function commit(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	message: string,
-	git: GitContext,
-): Promise<void> {
-	// Nothing staged: commit all tracked changes so the suggested message matches
-	const args = git.hasStagedChanges ? ["commit", "-m", message] : ["commit", "-a", "-m", message];
-	const result = await pi.exec("git", args, { cwd: ctx.cwd });
+async function commit(pi: ExtensionAPI, ctx: ExtensionContext, message: string): Promise<void> {
+	// Stage the entire working tree (tracked, modified, and untracked files) so the
+	// suggested message — which describes all of it — matches what gets committed
+	const add = await pi.exec("git", ["add", "-A"], { cwd: ctx.cwd });
+	if (add.code !== 0) {
+		ctx.ui.notify(`git add failed: ${(add.stderr || add.stdout).trim() || `exit code ${add.code}`}`, "error");
+		return;
+	}
+
+	const result = await pi.exec("git", ["commit", "-m", message], { cwd: ctx.cwd });
 
 	if (result.code === 0) {
 		const subject = message.split("\n")[0];
@@ -461,16 +459,14 @@ async function commit(
 }
 
 /** Edit the message in a multi-line editor, then commit it. */
-async function editAndCommit(pi: ExtensionAPI, ctx: ExtensionContext, message: string, git: GitContext) {
+async function editAndCommit(pi: ExtensionAPI, ctx: ExtensionContext, message: string) {
 	if (!ctx.hasUI) {
 		ctx.ui.notify("Committing requires interactive (TUI) mode.", "error");
 		return;
 	}
 
 	const edited = await ctx.ui.editor(
-		git.hasStagedChanges
-			? "Commit message — edit if needed, Enter commits the staged changes (Esc cancels)"
-			: "Commit message — edit if needed, Enter commits all tracked changes (Esc cancels)",
+		"Commit message — edit if needed, Enter stages everything and commits (Esc cancels)",
 		message,
 	);
 	if (edited === undefined) {
@@ -484,7 +480,7 @@ async function editAndCommit(pi: ExtensionAPI, ctx: ExtensionContext, message: s
 		return;
 	}
 
-	await commit(pi, ctx, finalMessage, git);
+	await commit(pi, ctx, finalMessage);
 }
 
 export default function commitMessageExtension(pi: ExtensionAPI) {
@@ -530,7 +526,7 @@ export default function commitMessageExtension(pi: ExtensionAPI) {
 			const subtitle = `${git.branch} • ${files} changed file(s)`;
 
 			if (doCommit) {
-				await editAndCommit(pi, ctx, message, git);
+				await editAndCommit(pi, ctx, message);
 				return;
 			}
 
@@ -547,7 +543,7 @@ export default function commitMessageExtension(pi: ExtensionAPI) {
 			);
 
 			if (result === "commit") {
-				await editAndCommit(pi, ctx, message, git);
+				await editAndCommit(pi, ctx, message);
 			}
 		},
 	});
