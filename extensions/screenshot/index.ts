@@ -14,7 +14,6 @@
  * interface (see platform.ts). Windows is implemented; Linux is stubbed.
  */
 
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -37,7 +36,9 @@ interface ListWindowsDetails {
 }
 
 const ScreenshotParams = Type.Object({
-	target: StringEnum(["desktop", "window"] as const, {
+	target: Type.Unsafe<"desktop" | "window">({
+		type: "string",
+		enum: ["desktop", "window"],
 		description:
 			'"desktop" captures the whole virtual desktop (all monitors combined) or one monitor via "monitor"; "window" captures a specific application window.',
 	}),

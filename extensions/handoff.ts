@@ -20,8 +20,8 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { complete, type Message } from "@earendil-works/pi-ai";
-import { complete as completeCompat, getModel } from "@earendil-works/pi-ai/compat";
+import type { Message } from "@earendil-works/pi-ai";
+import { complete, getModel } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { BorderedLoader, convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 
@@ -220,12 +220,12 @@ export default function (pi: ExtensionAPI) {
 					.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
 
 				doGenerate = async (signal) => {
-					const response = await completeCompat(
+					const response = await complete(
 						model,
 						{
 							systemPrompt: ctx.getSystemPrompt(),
 							messages: [
-								...messages,
+								...convertToLlm(messages),
 								{
 									role: "user" as const,
 									content: [{ type: "text" as const, text: `${HANDOFF_INSTRUCTIONS}\n\n## User's Goal for New Thread\n\n${goal}` }],

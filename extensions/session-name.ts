@@ -25,9 +25,9 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { Message } from "@earendil-works/pi-ai";
+import { convertToLlm, DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { complete } from "@earendil-works/pi-ai/compat";
 import {
     Container,
@@ -280,8 +280,8 @@ function extractText(content: unknown): string {
 }
 
 /** Full branch as messages (for the full strategy). */
-function buildMessages(branch: SessionEntry[]): Message[] {
-    const messages: Message[] = [];
+function buildMessages(branch: SessionEntry[]): AgentMessage[] {
+    const messages: AgentMessage[] = [];
     for (const entry of branch) {
         if (entry?.type === "message") {
             messages.push(entry.message);
@@ -336,7 +336,7 @@ function buildNameRequest(pi: ExtensionAPI, ctx: any, strategy: Strategy): (() =
         return () => ({
             systemPrompt: ctx.getSystemPrompt(),
             messages: [
-                ...messages,
+                ...convertToLlm(messages),
                 {
                     role: "user" as const,
                     content: [{ type: "text" as const, text: NAME_PROMPT }],
