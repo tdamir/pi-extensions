@@ -34,6 +34,28 @@ function outputCapFor(contextWindow: number): number {
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+/** Server-level names that mean the same thing as a pi thinking level. */
+const THINKING_LEVEL_ALIASES: Record<string, ThinkingLevel> = {
+  off: "off",
+  none: "off",
+  no: "off",
+  nothink: "off",
+  nothinking: "off",
+  disabled: "off",
+  disable: "off",
+  false: "off",
+  min: "minimal",
+  minimal: "minimal",
+  low: "low",
+  med: "medium",
+  medium: "medium",
+  high: "high",
+  xhigh: "xhigh",
+  extrahigh: "xhigh",
+  max: "max",
+  maximum: "max",
+};
+
 /**
  * llama-swap encodes a fixed reasoning effort as a `:{level}` suffix on the
  * model ID (e.g. `qwen3-coder:medium`). The suffix must be kept in the ID
@@ -53,6 +75,14 @@ export interface SwapModelEntry {
   architecture?: {
     input_modalities?: string[];
     modality?: string;
+  };
+  meta?: {
+    thinking?: boolean;
+    thinkingLevels?: string[];
+    llamaswap?: {
+      thinking?: boolean;
+      thinkingLevels?: string[];
+    };
   };
 }
 
@@ -79,6 +109,43 @@ function parseReasoningSuffix(id: string): ThinkingLevel | undefined {
   return match ? (match[1] as ThinkingLevel) : undefined;
 }
 
+/** Read reasoning metadata from either the top level of `meta` or `meta.llamaswap`. */
+function readReasoningMeta(entry: SwapModelEntry): { thinking?: boolean; levels?: string[] } {
+  const llamaswap = entry.meta?.llamaswap;
+  const thinking = llamaswap?.thinking ?? entry.meta?.thinking;
+  const rawLevels = llamaswap?.thinkingLevels ?? entry.meta?.thinkingLevels;
+  const levels = Array.isArray(rawLevels)
+    ? rawLevels.filter((level): level is string => typeof level === "string" && level.trim().length > 0)
+    : undefined;
+  return { thinking, levels: levels?.length ? levels : undefined };
+}
+
+/** Normalize a server thinking-level name so `no_think`, `no-think`, etc. all match. */
+function canonicalThinkingLevel(level: string): ThinkingLevel | undefined {
+  const key = level.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+  return THINKING_LEVEL_ALIASES[key] ?? THINKING_LEVELS.find((candidate) => candidate === key);
+}
+
+/**
+ * Build pi's thinking-level map from the levels the server reports in `meta`.
+ * The reported name is kept as the wire value (e.g. `no_think` -> `off`), and
+ * levels the server did not report are marked unsupported so pi hides them.
+ */
+function mapThinkingLevels(levels: string[] | undefined, pin?: ThinkingLevel): Record<string, string | null> {
+  const map = Object.fromEntries(THINKING_LEVELS.map((level) => [level, null])) as Record<string, string | null>;
+
+  for (const level of levels ?? []) {
+    const canonical = canonicalThinkingLevel(level);
+    if (canonical && map[canonical] === null) map[canonical] = level.trim();
+  }
+
+  if (pin) {
+    for (const level of THINKING_LEVELS) map[level] = level === pin ? (map[pin] ?? pin) : null;
+  }
+
+  return map;
+}
+
 /** Infer input types from the model's capabilities and architecture. */
 function inferInputTypes(
   capabilities: { vision?: boolean } | undefined,
@@ -94,24 +161,29 @@ function inferInputTypes(
 export function mapModel(entry: SwapModelEntry): SwapModel {
   const capabilities = entry.capabilities as { vision?: boolean } | undefined;
   const suffix = parseReasoningSuffix(entry.id);
+  const { thinking, levels } = readReasoningMeta(entry);
+  const reasoning = suffix
+    ? suffix !== "off"
+    : (thinking ?? (levels ? true : inferReasoning(entry.id)));
+  const hasThinkingLevels = Boolean(suffix || levels);
 
   return {
     id: entry.id,
     name: entry.name ?? entry.id,
-    reasoning: suffix ? suffix !== "off" : inferReasoning(entry.id),
+    reasoning,
     input: inferInputTypes(capabilities, entry.architecture),
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: entry.context_length ?? 128000,
     // Reply cap, NOT the context window: prompt + max_tokens must fit in n_ctx.
     maxTokens: outputCapFor(entry.context_length ?? 128000),
-    // Effort is baked into the model name: pin the thinking level to the
-    // suffix value and hide all other levels.
-    ...(suffix
+    // Prefer the levels advertised in `meta` (if any), and pin the level when
+    // the model ID carries a fixed-effort suffix.
+    ...(hasThinkingLevels
       ? {
-          thinkingLevelMap: Object.fromEntries(
-            THINKING_LEVELS.map((level) => [level, level === suffix ? level : null]),
-          ),
-          compat: { supportsReasoningEffort: false },
+          thinkingLevelMap: mapThinkingLevels(levels, suffix),
+          // A suffix means the effort is baked into the model ID; advertised
+          // levels mean the server accepts `reasoning_effort`.
+          compat: { supportsReasoningEffort: !suffix },
         }
       : {}),
   };

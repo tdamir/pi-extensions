@@ -39,7 +39,8 @@ It dynamically discovers available models from each configured llama-swap server
 
 - **Auto-discovery** — Fetches the full model list from each server's `/models` API on load; an unreachable server is skipped without blocking the others
 - **OpenAI-compatible** — Uses the `openai-completions` API format, so it works with any OpenAI-style client
-- **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
+- **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`, or `meta.llamaswap.thinking`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
+- **Server-reported thinking levels** — Uses `meta.llamaswap.thinkingLevels` (or `meta.thinkingLevels`) to expose only the levels the server supports, mapping names like `no_think` to pi's `off`
 - **Pinned reasoning effort** — Models with a `:{level}` suffix (e.g. `qwen3-coder:medium`) are pinned to that thinking level; all other levels are hidden for them
 - **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings`, vLLM's `usage`/`metrics`, and tensorfold's `tensorfold`/`speculative`/`exact_mode` diagnostics — and shows it under each assistant message
 - **HTML export with stats** — `/export-with-stats` exports the session to HTML with the usage stats included (the built-in `/export` skips them)
@@ -176,6 +177,8 @@ See the [llama-swap config example](https://github.com/mostlygeek/llama-swap/blo
 #### Reasoning-effort model variants
 
 If llama-swap exposes fixed-effort model variants with a `:{level}` suffix (`off`, `low`, `medium`, or `xhigh`, e.g. `qwen3-coder:medium`), the provider pins each variant to its matching thinking level and hides the others, so you can switch effort by switching models.
+
+Models that advertise `meta.llamaswap.thinkingLevels` (or `meta.thinkingLevels`) use those levels directly: reported names are sent as `reasoning_effort` (`no_think` maps to pi's `off`), and unreported pi levels are hidden. A `:{level}` suffix still pins the model to one level.
 
 ### Usage
 
