@@ -9,6 +9,8 @@
     "handoff",
     "commit-message",
     "benchmark",
+    "tokens-per-second",
+    "throughput",
     "screenshot",
     "screen-capture",
     "vision",

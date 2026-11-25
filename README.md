@@ -10,6 +10,7 @@ A collection of [pi](https://github.com/earendil-works/pi) extensions.
 | [commit-message](#commit-message) | Suggests a commit message from the current git changes with the current model, optionally committing it (`--commit`) |
 | [benchmark](#benchmark) | Runs a build requirement against the current model in a per-model working directory to compare LLMs, with an auto-generated HTML report (stats + chat) |
 | [context-size](#context-size) | `context_size` tool (and `/context-size` command) that reports the current session context usage |
+| [tokens-per-second](#tokens-per-second) | Shows a live token generation speed (`⚡ 34.2 tok/s`) in the status bar for the running turn, measured locally from the stream — no provider stats needed |
 | [screenshot](#screenshot) | `screenshot`/`list_windows` tools (and `/screenshot` command) that capture the desktop or a specific window and show the image to the agent (Windows, Linux planned) |
 | [vision](#vision) | `analyze_image` tool that answers questions about image files with a vision model, keeping images out of the conversation so request bodies stay small |
 | [headless-browser skill](#headless-browser-skill) | Skill with scripts to run headless Chrome/Edge via puppeteer-core — page screenshots, JS evaluation, and scripted UI interactions without downloading a browser |
@@ -42,7 +43,7 @@ It dynamically discovers available models from each configured llama-swap server
 - **Smart inference** — Detects reasoning models (e.g. `*-think`, `*.think`, or `meta.llamaswap.thinking`) and vision capabilities from model metadata (`capabilities.vision` or `architecture.input_modalities`)
 - **Server-reported thinking levels** — Uses `meta.llamaswap.thinkingLevels` (or `meta.thinkingLevels`) to expose only the levels the server supports, mapping names like `no_think` to pi's `off`
 - **Pinned reasoning effort** — Models with a `:{level}` suffix (e.g. `qwen3-coder:medium`) are pinned to that thinking level; all other levels are hidden for them
-- **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings`, vLLM's `usage`/`metrics`, and tensorfold's `tensorfold`/`speculative`/`exact_mode` diagnostics — and shows it under each assistant message
+- **Token & performance stats** — Taps the raw SSE stream to capture the telemetry the built-in parser drops — llama.cpp's `usage`/`timings`, vLLM's `usage`/`metrics`, and tensorfold's `tensorfold`/`speculative`/`exact_mode` diagnostics — and shows it under each assistant message (for a provider-agnostic live speed meter that needs no server telemetry, see [tokens-per-second](#tokens-per-second))
 - **HTML export with stats** — `/export-with-stats` exports the session to HTML with the usage stats included (the built-in `/export` skips them)
 - **Configurable servers** — One or more llama-swap server addresses via settings or the `/llama-swap-url` command
 - **Hot-reload** — Changes apply automatically on `/reload`
@@ -388,6 +389,29 @@ Context usage: 45,231 / 200,000 tokens (22.6%)
 Free: 154,769 tokens
 ```
 
+## tokens-per-second
+
+Shows the measured token generation speed of the currently running turn in the footer status bar, e.g.:
+
+```
+⚡ 34.2 tok/s
+```
+
+The rate is measured **locally from the token stream**, so it works with any provider — it does not wait for, or rely on, usage/timing metrics arriving from the engine (unlike the [llama-swap](#llama-swap-provider) stats, which need the server to emit them). Nothing is written to the session log; the number lives only in the status bar and disappears when the run settles.
+
+### How it works
+
+- **Counts streamed deltas** — every `text_delta`, `thinking_delta`, and `toolcall_delta` of the streaming assistant message contributes its characters, converted to approximate tokens with pi's own estimator constant (`chars / 3.5`)
+- **Streams-only timing** — time accrues only while tokens are actually arriving (first delta → message end), so tool execution and other gaps do not drag the number down. Across a multi-message turn it aggregates: `total tokens / total streaming time`
+- **Live updates** — refreshed on every delta plus a 500 ms timer, deduplicated so it does not spam re-renders. An 800 ms grace period hides the meaningless spike from the first couple of deltas
+- **Stays visible while tools run** — the rate freezes at each message end and remains shown during tool execution, then clears when the agent has fully settled (`agent_settled`), so a stale value never lingers
+- **Resets per turn** — cleared on `turn_start` and `session_start`; no-ops in print/JSON mode (`ctx.hasUI` guard)
+
+### Notes
+
+- The count is an *estimate* (`chars / 3.5`), so for CJK-heavy or code-heavy output the absolute number can drift ~10–20%; the trend and instantaneous speed are accurate. Swap the `estTokens()` helper for a real tokenizer if you need exact counts
+- No commands, tools, or settings — it registers nothing but the status entry, and loads automatically with the package
+
 ## screenshot
 
 Screen capture for the agent: it can see your screen and windows.
@@ -526,6 +550,7 @@ pi -e ./extensions/handoff.ts
 pi -e ./extensions/session-name.ts
 pi -e ./extensions/benchmark.ts
 pi -e ./extensions/context-size.ts
+pi -e ./extensions/tokens-per-second.ts
 pi -e ./extensions/screenshot
 pi -e ./extensions/vision
 ```
