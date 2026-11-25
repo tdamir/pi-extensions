@@ -35,12 +35,35 @@
  * Any text after the file path is treated as additional instructions and appended
  * to the task (e.g. "do the task in parallel mode").
  *
+ * Run profile: by default a benchmark run is RESTRICTED so models are compared
+ * on the same footing - only pi's own built-in tools stay active (read, bash,
+ * powershell, edit, write, grep, find, ls - whichever were enabled), every
+ * extension tool is removed, and only the `headless-browser` skill is offered
+ * to the model. `--all` (alias `--unrestricted`) keeps the session's tools and
+ * skills instead. The restriction is session-scoped (tools are recorded in the
+ * session transcript; the skill filter is re-applied when a benchmark session
+ * is resumed) and lasts until `/reload` or a new session.
+ *
+ * Vision mode: how the model may inspect images during the run. "embedded"
+ * (default) means the model uses its own image modality - it can `read` a PNG
+ * and the image goes into the transcript. "tool" additionally enables the
+ * vision extension's `analyze_image` tool, which answers questions about image
+ * files through a separate nested model call and keeps the image out of the
+ * transcript. Select it with `--vision=embedded|tool`, or the shorthands
+ * `--vision-embedded` / `--vision-tool`. The effective mode is part of the
+ * working directory name (`-vision-embedded` / `-vision-tool`) and recorded in
+ * task.md / summary.md / the run marker; it is shown in the footer and report.
+ *
  * Usage:
  *   /benchmark build a python CLI that converts csv to json
  *   /benchmark tasks/csv-to-cli.md
  *   /benchmark @tasks/csv-to-cli.md
  *   /benchmark @tasks/csv-to-cli.md do the task in parallel mode
  *   /benchmark @tasks/csv-to-cli.md -- prefer node, keep dependencies minimal
+ *   /benchmark --vision-tool @tasks/csv-to-cli.md
+ *   /benchmark --vision-embedded @tasks/csv-to-cli.md
+ *   /benchmark --vision=tool tasks/csv-to-cli.md
+ *   /benchmark --all @tasks/csv-to-cli.md
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -64,6 +87,10 @@ const BENCHMARKS_DIR = "benchmarks";
 interface PendingRun {
 	workDir: string;
 	modelLabel: string;
+	vision: VisionMode;
+	profile: BenchmarkProfile;
+	removedTools: string[];
+	nativeImagesBlocked: boolean;
 	startedAt: Date;
 }
 
@@ -78,6 +105,14 @@ interface BenchmarkRunData {
 	outcome?: string;
 	/** Model context window (from ctx.model at run end) - the session file itself does not persist it. */
 	contextWindow?: number;
+	/** Whether the analyze_image tool was active for this run (captured at start). */
+	vision?: VisionMode;
+	/** Tool/skill profile of the run: restricted (built-in tools + headless-browser skill) or all. */
+	profile?: BenchmarkProfile;
+	/** Tools this run removed from the session (restored by a later --all run in the same session). */
+	removedTools?: string[];
+	/** True when native image input was blocked so the model behaves like a text-only model (vision=tool). */
+	nativeImagesBlocked?: boolean;
 	summaryPath?: string;
 	reportPath?: string;
 	sessionCopyPath?: string;
@@ -85,14 +120,130 @@ interface BenchmarkRunData {
 
 const RUN_ENTRY_TYPE = "benchmark-run";
 const STATUS_KEY = "benchmark";
+const VISION_TOOL = "analyze_image";
+/** The one skill a restricted benchmark run may load. */
+const BENCHMARK_SKILL = "headless-browser";
+/** Tools that ship with pi itself - the only ones a restricted benchmark run keeps. */
+const BUILTIN_TOOLS = new Set(["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"]);
+
+/** How the model may inspect images during a run: "embedded" = its own image modality, "tool" = the analyze_image tool. */
+type VisionMode = "embedded" | "tool";
+/** Tool/skill profile: "restricted" = pi built-ins + headless-browser skill only, "all" = session tools and skills. */
+type BenchmarkProfile = "restricted" | "all";
+
+/**
+ * Session-scoped skill restriction. Set by /benchmark (restricted profile) and
+ * cleared by /benchmark --all, /reload or a new session; the before_agent_start
+ * handler filters systemPromptOptions.skills while it is true. pi has no
+ * setActiveSkills() API - the skills list is only mutable per run through the
+ * system prompt options.
+ */
+let restrictSkills = false;
+
+/**
+ * Session-scoped native-image block for vision=tool runs. When true the session
+ * behaves like a text-only model: images returned by tools or attached to user
+ * input are replaced by a placeholder before they enter the transcript, and
+ * history images are stripped from requests. analyze_image still works because
+ * it reads the file itself and sends the image in a separate nested call.
+ */
+let blockNativeImages = false;
+
+/** Text that replaces an image the session is not allowed to see. */
+const IMAGE_OMITTED =
+	"[image omitted - this session cannot view images directly. Use analyze_image with the file path to ask a question about it.]";
+
+const VISION_TOOL_VALUES = new Set(["tool", "on", "true", "yes", "enabled", "enable", "analyze"]);
+const VISION_EMBEDDED_VALUES = new Set(["embedded", "off", "false", "no", "disabled", "disable", "native", "model", "builtin", "built-in"]);
 
 /** One-line footer text for the current benchmark state. */
 function footerText(d: BenchmarkRunData): string {
+	const vision = d.vision ? ` \u00b7 vision=${d.vision}` : "";
 	if (d.status === "done") {
 		const dur = d.durationMs !== undefined ? formatDuration(d.durationMs) : "?";
-		return `\u2691 benchmark: ${d.modelLabel} - ${d.outcome ?? "completed"} (${dur})`;
+		return `\u2691 benchmark: ${d.modelLabel}${vision} - ${d.outcome ?? "completed"} (${dur})`;
 	}
-	return `\u2691 benchmark: ${d.modelLabel} - running`;
+	return `\u2691 benchmark: ${d.modelLabel}${vision} - running`;
+}
+
+/**
+ * Strip leading benchmark flags from the command argument. Supported forms:
+ *   --vision=tool|embedded [mode]     --vision-tool / --vision-embedded
+ *   --all / --unrestricted / --full
+ * Returns the remaining text (the requirement / task file) untouched.
+ */
+function parseBenchmarkFlags(argText: string): {
+	vision?: VisionMode;
+	profile: BenchmarkProfile;
+	rest: string;
+	error?: string;
+} {
+	let rest = argText.trimStart();
+	let vision: VisionMode | undefined;
+	let profile: BenchmarkProfile = "restricted";
+	const flagRe = /^--(vision|vision-tool|vision-embedded|all|unrestricted|full)(?:=(\S+))?(?=\s|$)/i;
+	for (;;) {
+		const m = flagRe.exec(rest);
+		if (!m) break;
+		const flag = m[1].toLowerCase();
+		let value = m[2]?.toLowerCase();
+		let consumed = m[0].length;
+
+		if (flag === "all" || flag === "unrestricted" || flag === "full") {
+			if (value !== undefined) return { rest, profile, error: `--${flag} takes no value` };
+			profile = "all";
+			rest = rest.slice(consumed).trimStart();
+			continue;
+		}
+
+		if (flag === "vision-tool" || flag === "vision-embedded") {
+			if (value !== undefined) return { rest, profile, error: `--${flag} takes no value` };
+			vision = flag === "vision-tool" ? "tool" : "embedded";
+			rest = rest.slice(consumed).trimStart();
+			continue;
+		}
+
+		// --vision requires a mode: inline (--vision=tool) or next token (--vision tool).
+		if (value === undefined) {
+			const afterFlag = rest.slice(consumed).trimStart();
+			const next = /^(\S+)/.exec(afterFlag);
+			const candidate = next?.[1].toLowerCase();
+			if (next && candidate && (VISION_TOOL_VALUES.has(candidate) || VISION_EMBEDDED_VALUES.has(candidate))) {
+				value = candidate;
+				consumed = rest.length - afterFlag.length + next[1].length;
+			}
+		}
+
+		if (value === undefined) {
+			return {
+				rest,
+				profile,
+				error: "--vision needs a mode - use --vision=tool, --vision=embedded, --vision-tool or --vision-embedded",
+			};
+		}
+		if (VISION_TOOL_VALUES.has(value)) vision = "tool";
+		else if (VISION_EMBEDDED_VALUES.has(value)) vision = "embedded";
+		else {
+			return {
+				rest,
+				profile,
+				error: `Unknown vision mode \"${value}\" - use --vision=tool, --vision=embedded, --vision-tool or --vision-embedded`,
+			};
+		}
+		rest = rest.slice(consumed).trimStart();
+	}
+	// Reject unknown leading options instead of silently treating them as part of
+	// the requirement (e.g. the old --no-vision spelling).
+	const unknown = /^--([a-z][\w-]*)(?=[\s=]|$)/i.exec(rest);
+	if (unknown) {
+		return {
+			vision,
+			profile,
+			rest,
+			error: `Unknown option --${unknown[1]} - supported: --vision=embedded|tool, --vision-tool, --vision-embedded, --all`,
+		};
+	}
+	return { vision, profile, rest };
 }
 
 /** provider/model id (+ thinking level) -> safe directory name, e.g. "llama-swap_qwen3-coder-8b@medium" */
@@ -127,14 +278,17 @@ export default function (pi: ExtensionAPI) {
 		if (!d) return undefined;
 
 		const box = new Box(1, 1, (t) => theme.bg("customMessageBg", t));
+		const vision = d.vision ? ` \u00b7 vision=${d.vision}` : "";
 		if (d.status === "done") {
 			const dur = d.durationMs !== undefined ? formatDuration(d.durationMs) : "?";
 			const color = d.outcome && d.outcome !== "completed" ? "error" : "success";
-			box.addChild(new Text(theme.fg(color, `\u2691 benchmark ${d.modelLabel} - ${d.outcome ?? "completed"} in ${dur}`)));
+			box.addChild(new Text(theme.fg(color, `\u2691 benchmark ${d.modelLabel}${vision} - ${d.outcome ?? "completed"} in ${dur}`)));
 		} else {
-			box.addChild(new Text(theme.fg("accent", `\u2691 benchmark ${d.modelLabel} - running`)));
+			box.addChild(new Text(theme.fg("accent", `\u2691 benchmark ${d.modelLabel}${vision} - running`)));
 		}
 		if (expanded) {
+			if (d.vision) box.addChild(new Text(theme.fg("dim", `vision: ${d.vision}`)));
+			if (d.profile) box.addChild(new Text(theme.fg("dim", `tools/skills: ${d.profile}`)));
 			box.addChild(new Text(theme.fg("dim", `workdir: ${d.workDir}`)));
 			if (d.summaryPath) box.addChild(new Text(theme.fg("dim", `summary: ${d.summaryPath}`)));
 			if (d.reportPath) box.addChild(new Text(theme.fg("dim", `report: ${d.reportPath}`)));
@@ -143,7 +297,58 @@ export default function (pi: ExtensionAPI) {
 		return box;
 	});
 
-	// Restore the footer marker when a benchmark session is resumed/reloaded.
+	// Restrict the skills offered to the model while a restricted benchmark run is
+	// in effect. pi exposes no setActiveSkills(): the run's skill list lives in
+	// systemPromptOptions and is mutable from before_agent_start, so filtering it
+	// here applies to every run for the rest of the session.
+	pi.on("before_agent_start", async (event) => {
+		if (restrictSkills) {
+			event.systemPromptOptions.skills = event.systemPromptOptions.skills.filter((skill) => skill.name === BENCHMARK_SKILL);
+		}
+		if (blockNativeImages) {
+			event.systemPromptOptions.promptGuidelines.push(
+				"This session cannot view images directly: image files are not readable and any image attached to a message " +
+					"or returned by a tool is replaced by a placeholder. To ask about an image, call analyze_image with the " +
+					"file path and a question - it sends the image to a separate vision call and returns text.",
+			);
+		}
+	});
+
+	// vision=tool runs behave like a text-only session: strip images from tool
+	// results (e.g. read on a PNG, screenshot) before they reach the transcript.
+	pi.on("tool_result", async (event) => {
+		if (!blockNativeImages || !event.content.some((c) => c.type === "image")) return;
+		const content = event.content.map((c) => (c.type === "image" ? { type: "text" as const, text: IMAGE_OMITTED } : c));
+		return { content };
+	});
+
+	// Same for images attached to user input.
+	pi.on("input", async (event) => {
+		if (!blockNativeImages || !event.images?.length) return;
+		const note = `[${event.images.length} attached image(s) omitted - this session cannot view images directly. Use analyze_image with the file path instead.]`;
+		return { action: "transform", text: event.text ? `${event.text}\n\n${note}` : note, images: [] };
+	});
+
+	// History images (e.g. from before the benchmark run or a resumed session)
+	// are stripped from every request as well.
+	pi.on("context", async (event) => {
+		if (!blockNativeImages) return;
+		let changed = false;
+		const messages = event.messages.map((message) => {
+			if (message.role !== "user" && message.role !== "toolResult") return message;
+			if (!Array.isArray(message.content) || !message.content.some((c) => c.type === "image")) return message;
+			changed = true;
+			return {
+				...message,
+				content: message.content.map((c) => (c.type === "image" ? { type: "text" as const, text: IMAGE_OMITTED } : c)),
+			};
+		});
+		return changed ? { messages } : undefined;
+	});
+
+	// Restore the footer marker (and the skill/image restrictions) when a
+	// benchmark session is resumed/reloaded. The tool loadout itself is restored
+	// by pi from the session transcript.
 	pi.on("session_start", async (_event, ctx) => {
 		let last: BenchmarkRunData | undefined;
 		for (const entry of ctx.sessionManager.getEntries()) {
@@ -151,7 +356,11 @@ export default function (pi: ExtensionAPI) {
 				last = entry.data as BenchmarkRunData;
 			}
 		}
-		if (last && ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, footerText(last));
+		if (last) {
+			restrictSkills = last.profile === "restricted";
+			blockNativeImages = last.nativeImagesBlocked === true;
+			if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, footerText(last));
+		}
 	});
 
 	pi.on("agent_settled", async (event, ctx) => {
@@ -190,6 +399,14 @@ export default function (pi: ExtensionAPI) {
 				"# Benchmark Execution Summary",
 				"",
 				`- **Model:** ${run.modelLabel}`,
+				`- **Vision:** ${
+					run.vision === "tool"
+						? run.nativeImagesBlocked
+							? "tool (analyze_image only - native image input blocked)"
+							: "tool (analyze_image available - session keeps its own image handling)"
+						: "embedded (model's own image modality)"
+				}`,
+				`- **Tools/skills:** ${run.profile === "restricted" ? "restricted (pi built-in tools + headless-browser skill only)" : "all (session tools and skills)"}`,
 				`- **Started:** ${run.startedAt.toISOString()}`,
 				`- **Ended:** ${endedAt.toISOString()}`,
 				`- **Duration:** ${formatDuration(endedAt.getTime() - run.startedAt.getTime())}`,
@@ -220,6 +437,10 @@ export default function (pi: ExtensionAPI) {
 				status: "done",
 				workDir: run.workDir,
 				modelLabel: run.modelLabel,
+				vision: run.vision,
+				profile: run.profile,
+				removedTools: run.removedTools,
+				nativeImagesBlocked: run.nativeImagesBlocked,
 				startedAt: run.startedAt.toISOString(),
 				endedAt: endedAt.toISOString(),
 				durationMs: endedAt.getTime() - run.startedAt.getTime(),
@@ -255,6 +476,10 @@ export default function (pi: ExtensionAPI) {
 				status: "done",
 				workDir: run.workDir,
 				modelLabel: run.modelLabel,
+				vision: run.vision,
+				profile: run.profile,
+				removedTools: run.removedTools,
+				nativeImagesBlocked: run.nativeImagesBlocked,
 				startedAt: run.startedAt.toISOString(),
 				endedAt: new Date().toISOString(),
 				outcome: `error: summary write failed: ${message}`,
@@ -336,14 +561,40 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("benchmark", {
 		description:
-			"Benchmark the current model: /benchmark <requirement or file with the requirement> - creates benchmarks/<model>/ with workspace/ and final/, then starts the task in this session",
+			"Benchmark the current model: /benchmark [--vision=embedded|tool] [--all] <requirement or file with the requirement> - creates benchmarks/<model>[-all]-vision-<mode>/ with workspace/ and final/, restricts the session to pi's built-in tools + the headless-browser skill, then starts the task in this session",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				{ value: "--vision-tool", label: "--vision-tool", description: "Use the analyze_image tool (separate vision model call) for this run" },
+				{ value: "--vision-embedded", label: "--vision-embedded", description: "Use only the model's own image modality for this run" },
+				{ value: "--vision=tool", label: "--vision=tool", description: "Same as --vision-tool" },
+				{ value: "--vision=embedded", label: "--vision=embedded", description: "Same as --vision-embedded" },
+				{ value: "--all", label: "--all", description: "Keep the session's tools and skills instead of the restricted benchmark set" },
+			];
+			const p = prefix.toLowerCase();
+			const matches = options.filter((o) => o.value.startsWith(p));
+			return matches.length > 0 ? matches : null;
+		},
 		handler: async (args, ctx) => {
+			// Leading flags select the tool/skill profile and the vision mode for
+			// this run, e.g.
+			//   /benchmark --vision-tool @tasks/csv-to-cli.md
+			//   /benchmark --vision-embedded tasks/csv-to-cli.md
+			//   /benchmark --vision=tool tasks/csv-to-cli.md
+			//   /benchmark --all @tasks/csv-to-cli.md
+			const parsed = parseBenchmarkFlags(args?.trim() ?? "");
+			if (parsed.error) {
+				ctx.ui.notify(parsed.error, "error");
+				return;
+			}
 			// Support an "@"-prefixed file reference, e.g. /benchmark @tasks/csv-to-cli.md
 			// Anything after the file path is treated as additional instructions, e.g.
 			// /benchmark @tasks/csv-to-cli.md do the task in parallel mode
-			let argText = (args?.trim() ?? "").replace(/^@/, "");
+			let argText = parsed.rest.replace(/^@/, "");
 			if (!argText) {
-				ctx.ui.notify("Usage: /benchmark <requirement to build, or a file containing it> [additional instructions]", "error");
+				ctx.ui.notify(
+					"Usage: /benchmark [--vision=embedded|tool] [--all] <requirement to build, or a file containing it> [additional instructions]",
+					"error",
+				);
 				return;
 			}
 
@@ -388,10 +639,60 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Create the per-model working directory (append timestamp if it already exists)
+			// Resolve the tool profile and vision state for this run and apply them
+			// BEFORE anything is recorded, so the directory name, task.md, session
+			// name and run marker all describe the same configuration.
+			//
+			// Default (restricted): keep only pi's built-in tools and offer only the
+			// headless-browser skill. Extension tools (screenshot, analyze_image,
+			// context_size, ...) and every other skill are withheld so models are
+			// compared on the same footing. --all keeps the session's tools/skills.
+			const visionRegistered = pi.getAllTools().some((tool) => tool.name === VISION_TOOL);
+			if (parsed.vision === "tool" && !visionRegistered) {
+				ctx.ui.notify(
+					`Cannot use the vision tool: the "${VISION_TOOL}" tool is not registered - load the vision extension first.`,
+					"error",
+				);
+				return;
+			}
+
+			let nextTools = pi.getActiveTools();
+			const beforeTools = [...nextTools];
+			if (parsed.profile === "restricted") {
+				nextTools = nextTools.filter((name) => BUILTIN_TOOLS.has(name));
+			} else {
+				// --all: keep the session's tools, and give back anything an earlier
+				// benchmark run in this session removed (e.g. running --all after a
+				// restricted run without /reload).
+				const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+				let lastMarker: BenchmarkRunData | undefined;
+				for (const entry of ctx.sessionManager.getEntries()) {
+					if (entry.type === "custom" && entry.customType === RUN_ENTRY_TYPE) lastMarker = entry.data as BenchmarkRunData;
+				}
+				for (const name of lastMarker?.removedTools ?? []) {
+					if (registered.has(name) && !nextTools.includes(name)) nextTools.push(name);
+				}
+			}
+			if (parsed.vision === "tool" && !nextTools.includes(VISION_TOOL)) nextTools = [...nextTools, VISION_TOOL];
+			else if (parsed.vision === "embedded") nextTools = nextTools.filter((name) => name !== VISION_TOOL);
+			pi.setActiveTools(nextTools);
+			const afterTools = pi.getActiveTools();
+			const removedTools = beforeTools.filter((name) => !afterTools.includes(name));
+			const vision: VisionMode = afterTools.includes(VISION_TOOL) ? "tool" : "embedded";
+			restrictSkills = parsed.profile === "restricted";
+			// vision=tool means the model must reach images only through the tool, so
+			// native image input is blocked for the rest of the session. --all without
+			// an explicit mode leaves the session's own behaviour alone.
+			blockNativeImages = vision === "tool" && (parsed.profile === "restricted" || parsed.vision === "tool");
+
+			// Create the per-model working directory (append timestamp if it already exists).
+			// The name carries the tool/skill profile (`-all` for unrestricted runs) and
+			// the vision mode (`-vision-embedded` / `-vision-tool`) so variant runs of
+			// the same model sit side by side under ./benchmarks/ and never overwrite
+			// each other.
 			const modelLabel =
 				model.provider + "/" + model.id + (ctx.thinkingLevel && ctx.thinkingLevel !== "off" ? ` @ ${ctx.thinkingLevel}` : "");
-			const baseName = modelSlug(model.provider, model.id, ctx.thinkingLevel);
+			const baseName = `${modelSlug(model.provider, model.id, ctx.thinkingLevel)}${parsed.profile === "all" ? "-all" : ""}-vision-${vision}`;
 			const now = new Date();
 			let workDir = resolve(ctx.cwd, BENCHMARKS_DIR, baseName);
 			if (existsSync(workDir)) {
@@ -409,12 +710,32 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Persist the task with metadata
+			const profileLabel =
+				parsed.profile === "restricted"
+					? "restricted (pi built-in tools + headless-browser skill only)"
+					: "all (session tools and skills)";
+			const skillsGuidance =
+				parsed.profile === "restricted"
+					? "- The headless-browser skill is the only skill available in this run - use it for debugging, testing and reviewing the work, but do not use it to browse the web."
+					: "- Use headless-browser skill for debugging, testing and reviewing the work, but do not use it to browse the web.";
+			const visionGuidance =
+				vision === "tool"
+					? "\n- This session cannot view images directly - image files are not readable and any image attached to a message or returned by a tool is replaced by a placeholder. When you need to check what an image (screenshot, rendered page) shows, use the analyze_image tool with the file path and a specific question. It sends the image to a separate vision call and returns text, so the image never enters this conversation."
+					: "";
 			const taskPath = join(workDir, "task.md");
 			writeFileSync(
 				taskPath,
 				`# Benchmark Task
 
 - **Model:** ${modelLabel}
+- **Vision:** ${
+				vision === "tool"
+					? blockNativeImages
+						? "tool (analyze_image only - native image input blocked)"
+						: "tool (analyze_image available - session keeps its own image handling)"
+					: "embedded (model's own image modality)"
+			}
+- **Tools/skills:** ${profileLabel}
 - **Started:** ${now.toISOString()}
 - **Working directory:** ${workDir}
 
@@ -434,8 +755,7 @@ export default function (pi: ExtensionAPI) {
 - Do not create or modify anything outside the working folder.
 
 ## Skills and Tools
-- Use headless-browser skill for debugging, testing and reviewing the work, but do not use it to browse the web.
-- When you need to check what an image (screenshot, rendered page) shows, use the analyze_image tool with the file path and a specific question. It answers with text and keeps the image out of the conversation, so request bodies stay small.
+${skillsGuidance}${visionGuidance}
 
 ## Requirement
 
@@ -443,15 +763,22 @@ ${requirement}
 `,
 			);
 
-			// Name the session after the task and the model before starting the run.
-			// The leading banner marks it as a benchmark session in /resume pickers.
-			pi.setSessionName(`\u2691 ${taskLabel(requirement, requirementSource)} - ${modelLabel}`);
+			// Name the session after the task, the model and the vision state before
+			// starting the run. The leading banner marks it as a benchmark session in
+			// /resume pickers.
+			pi.setSessionName(
+				`\u2691 ${taskLabel(requirement, requirementSource)} - ${modelLabel} [vision=${vision}${parsed.profile === "all" ? ", all tools" : ""}]`,
+			);
 
 			// Persist a durable "benchmark session" marker and show it in the footer.
 			const running: BenchmarkRunData = {
 				status: "running",
 				workDir,
 				modelLabel,
+				vision,
+				profile: parsed.profile,
+				removedTools,
+				nativeImagesBlocked: blockNativeImages,
 				startedAt: now.toISOString(),
 				// Known from the selected model at start - lets the report show
 				// context usage % even if the run never reaches the done marker
@@ -463,7 +790,10 @@ ${requirement}
 			pi.appendEntry(RUN_ENTRY_TYPE, running);
 			if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, footerText(running));
 
-			ctx.ui.notify(`Benchmark started: ${workDir}`, "info");
+			ctx.ui.notify(
+				`Benchmark started (vision=${vision}${blockNativeImages ? ", native image input blocked" : ""}, ${parsed.profile === "restricted" ? "built-in tools + headless-browser skill only" : "session tools and skills"}): ${workDir}`,
+				"info",
+			);
 
 			// Read back the exact task.md content and send it to the session
 			let taskContent: string;
@@ -475,7 +805,7 @@ ${requirement}
 			}
 
 			// pi.sendUserMessage always triggers a turn; deliverAs queues it if the agent is busy
-			pendingRun = { workDir, modelLabel, startedAt: now };
+			pendingRun = { workDir, modelLabel, vision, profile: parsed.profile, removedTools, nativeImagesBlocked: blockNativeImages, startedAt: now };
 			pi.sendUserMessage(taskContent);
 		},
 	});

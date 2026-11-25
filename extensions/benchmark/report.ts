@@ -34,6 +34,12 @@ interface BenchmarkRunData {
 	durationMs?: number;
 	outcome?: string;
 	contextWindow?: number;
+	/** How the model could inspect images: "tool" = analyze_image tool, "embedded" = its own image modality. */
+	vision?: "embedded" | "tool";
+	/** True when native image input was blocked (vision=tool runs behave like text-only sessions). */
+	nativeImagesBlocked?: boolean;
+	/** Tool/skill profile of the run: restricted (built-in tools + headless-browser skill) or all. */
+	profile?: "restricted" | "all";
 	summaryPath?: string;
 	reportPath?: string;
 	sessionCopyPath?: string;
@@ -191,6 +197,26 @@ function dashboardHtml(
 
 	const cards: string[] = [];
 	cards.push(card("Outcome", outcome, run ? `${fmtTime(run.startedAt)} → ${fmtTime(endedLabel)}` : undefined, tone));
+	if (run?.vision) {
+		cards.push(
+			card(
+				"Vision",
+				run.vision,
+				run.vision === "tool"
+					? `analyze_image tool · native image input ${run.nativeImagesBlocked ? "blocked" : "allowed"}`
+					: "model's own image modality",
+			),
+		);
+	}
+	if (run?.profile) {
+		cards.push(
+			card(
+				"Tools/skills",
+				run.profile,
+				run.profile === "restricted" ? "pi built-ins + headless-browser skill" : "session tools and skills",
+			),
+		);
+	}
 	cards.push(
 		card(
 			"Duration",
@@ -291,7 +317,7 @@ function dashboardHtml(
 	return `<section id="bench-dashboard">
 <div class="bench-head">
 <div class="bench-title">⚑ ${esc(run?.modelLabel ?? "benchmark run")} <span class="bench-badge ${badge}">${esc(outcome)}</span></div>
-<div class="bench-meta">${run ? `started ${esc(fmtTime(run.startedAt))} · ended ${esc(fmtTime(endedLabel))} · <strong>${esc(durationMs !== undefined ? fmtMs(durationMs) : "?")}</strong>` : "run marker not found in the session copy - showing whole-session stats"} · ${esc(workDir)}</div>
+<div class="bench-meta">${run ? `started ${esc(fmtTime(run.startedAt))} · ended ${esc(fmtTime(endedLabel))} · <strong>${esc(durationMs !== undefined ? fmtMs(durationMs) : "?")}</strong>${run.vision ? ` · vision <strong>${esc(run.vision)}</strong>` : ""}${run.profile ? ` · tools/skills <strong>${esc(run.profile)}</strong>` : ""}` : "run marker not found in the session copy - showing whole-session stats"} · ${esc(workDir)}</div>
 ${linksHtml}
 </div>
 <div class="bench-cards">${cards.join("")}</div>

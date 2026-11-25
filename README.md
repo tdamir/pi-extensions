@@ -294,10 +294,10 @@ Requires interactive (TUI) mode.
 
 Benchmarks the currently selected model by giving it a build requirement and executing it right in the current interactive session.
 
-Each run creates a working directory named after the model (and its active thinking level, if any) under `./benchmarks/`:
+Each run creates a working directory named after the model (and its active thinking level, if any), plus `-all` for unrestricted runs and the vision mode, under `./benchmarks/`:
 
 ```
-benchmarks/<provider>_<model>[@<thinking>]/
+benchmarks/<provider>_<model>[@<thinking>][-all]-vision-embedded|tool/
 ├── task.md            # the requirement plus run metadata (model, timestamp)
 ├── workspace/         # intermediate work files while building
 ├── final/             # final deliverables
@@ -306,12 +306,12 @@ benchmarks/<provider>_<model>[@<thinking>]/
 └── report.html        # HTML report (dashboard + chat), auto-written when the task ends
 ```
 
-If the directory already exists (e.g. from an earlier run), a timestamp suffix is appended so runs never collide. The current session is renamed to `<task> - <provider>/<model>[@ <thinking>]` before the run starts, so benchmark sessions are easy to spot in the session selector.
+If the directory already exists (e.g. from an earlier run), a timestamp suffix is appended so runs never collide. The current session is renamed to `<task> - <provider>/<model>[@ <thinking>] [vision=embedded|tool]` (plus `, all tools` for `--all` runs) before the run starts, so benchmark sessions are easy to spot in the session selector.
 
 ### Usage
 
 ```
-/benchmark <requirement to build, or a file containing it>
+/benchmark [--vision=embedded|tool] [--all] <requirement to build, or a file containing it>
 ```
 
 If the argument is a path to an existing file (relative to the current directory), the file's content is used as the requirement — handy for sharing one task file across all model runs.
@@ -321,16 +321,47 @@ Examples:
 ```
 /benchmark build a python CLI that converts csv files to json
 /benchmark tasks/csv-to-cli.md
+/benchmark --vision-tool @tasks/csv-to-cli.md
+/benchmark --vision-embedded @tasks/csv-to-cli.md
+/benchmark --vision=tool @tasks/csv-to-cli.md
+/benchmark --all @tasks/csv-to-cli.md
 ```
+
+### Tool and skill profile
+
+By default a benchmark run is **restricted**: only pi's own built-in tools stay active (`read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, `ls` — whichever were enabled), every extension tool (`screenshot`, `analyze_image`, `context_size`, …) is removed, and the only skill offered to the model is `headless-browser`. That keeps model comparisons on the same footing regardless of which extensions are installed.
+
+`--all` (aliases `--unrestricted`, `--full`) skips the restriction and keeps the session's current tools and skills; its runs are named `<model>-all-vision-<mode>`.
+
+The restriction is session-scoped: pi records the tool loadout in the session transcript, and the skill filter is re-applied on every run until `/reload` or a new session (and restored when a benchmark session is resumed). pi has no `setActiveSkills()` API — the extension filters `systemPromptOptions.skills` in a `before_agent_start` handler, which is the per-run hook for the skills list.
+
+### Vision mode: embedded vs tool
+
+A benchmark run can inspect images in two ways, selected with leading flags:
+
+- **embedded** (default) — the model uses its own image modality: it can `read` a PNG and the image goes into the transcript and every subsequent request. Nothing extra is enabled.
+- **tool** — enables the vision extension's `analyze_image` tool, which answers questions about image files through a separate nested model call, and makes the session behave like a **text-only model**: images returned by tools (`read` on a PNG, screenshots) or attached to input are replaced by a placeholder before they enter the transcript, history images are stripped from requests, and the system prompt tells the model it cannot view images directly and must call `analyze_image`. The image never enters the transcript, so request bodies stay small even in long sessions.
+
+| Flag | Effect |
+| --- | --- |
+| `--vision-tool`, `--vision=tool` (also `--vision tool`) | adds `analyze_image` to the run's tools |
+| `--vision-embedded`, `--vision=embedded` (also `--vision embedded`) | withholds `analyze_image`; only the model's own image modality |
+| no flag | restricted profile: `embedded` |
+
+`--vision` on its own is rejected — it needs a mode, since "vision" alone doesn't say whether the tool or the model's own modality is meant. The old `--vision` / `--no-vision` spellings are rejected as unknown options.
+
+The mode is resolved before anything is recorded and persisted everywhere: the working directory name (`-vision-embedded` / `-vision-tool`, after `-all` for unrestricted runs), `task.md`, the session name (`[vision=embedded|tool]`), the benchmark run marker (footer + transcript card), `summary.md`, and **Vision** / **Tools/skills** cards in `report.html` — so variant runs of the same model sit side by side and can be compared directly.
+
+Selecting `tool` requires the vision extension to be loaded (the `analyze_image` tool registered); otherwise the command refuses to start. The toolset change and the native-image block are session-scoped, exactly like `/vision on|off`, so they stay in effect after the run (and are restored when a benchmark session is resumed); a later `--vision-embedded` run or `/reload` restores native image input. A `--all` run only blocks native images when `tool` was requested explicitly — without a flag it leaves the session's own behavior alone.
 
 To benchmark several models, select each model (`Ctrl+P` / `/model`) and run `/benchmark` with the same requirement — then compare the `final/` folders of the per-model directories.
 
-When the task finishes (the agent run ends), the extension writes `summary.md` into the run's directory: model, start/end timestamps, wall-clock duration, outcome (`completed` / `aborted` / `error`), the same llama-swap stats the `/swap-stats` command shows (including the tool-calls and skills sections), and a pi-style session section (message counts, input/cached/uncached/output/total tokens, final context usage, cost). Everything except the session identity (name/file/id) is scoped to that run only, so multiple benchmark runs can share one session without polluting each other's summaries.
+When the task finishes (the agent run ends), the extension writes `summary.md` into the run's directory: model, vision mode (embedded/tool), tools/skills profile, start/end timestamps, wall-clock duration, outcome (`completed` / `aborted` / `error`), the same llama-swap stats the `/swap-stats` command shows (including the tool-calls and skills sections), and a pi-style session section (message counts, input/cached/uncached/output/total tokens, final context usage, cost). Everything except the session identity (name/file/id) is scoped to that run only, so multiple benchmark runs can share one session without polluting each other's summaries.
 
 Alongside the summary it also writes:
 
 - `session-*.jsonl` — a copy of the pi session file (chat transcript plus all persisted stats: tool calls, llama-swap usage entries, the benchmark run marker). It is the single source of truth for the report — there is no separate results.json
-- `report.html` — the chat rendered with pi's built-in session exporter (the same path as `/export-with-stats`, so ⚡ llama-swap per-request lines are visible), with a benchmark dashboard injected at the top: run header with outcome badge and links to all artifacts, stat cards (duration, tool calls, tokens, throughput, cache hit rate, draft acceptance, context usage — the context window comes from the run marker, captured from the model metadata when the run ends), a per-tool breakdown with time-share bars and skills-used chips, a llama-swap engine panel, and a collapsible per-request table. All stats are computed from the session copy, scoped to the run's time window; all styling is scoped to the injected section so exporter theme changes can't collide
+- `report.html` — the chat rendered with pi's built-in session exporter (the same path as `/export-with-stats`, so ⚡ llama-swap per-request lines are visible), with a benchmark dashboard injected at the top: run header with outcome badge and links to all artifacts, stat cards (duration, tool calls, tokens, throughput, cache hit rate, draft acceptance, context usage — the context window comes from the run marker, captured from the model metadata when the run ends — plus vision and tools/skills profile), a per-tool breakdown with time-share bars and skills-used chips, a llama-swap engine panel, and a collapsible per-request table. All stats are computed from the session copy, scoped to the run's time window; all styling is scoped to the injected section so exporter theme changes can't collide
 
 To (re)generate the HTML report — e.g. for older runs made before the report existed — use:
 
@@ -418,10 +449,13 @@ Every image that reaches the session (a screenshot tool result, `read` on a PNG,
 A fixed judge model also keeps comparisons consistent across benchmark runs.
 
 - **Usage accounting** — the nested model call's token usage is reported on the tool result, so session totals stay accurate
+- **Session toggle** — `/vision` (or `/vision on|off|toggle|status`) disables `analyze_image` for the current session, removing it from the model's active tool set and prompt. The change is session-scoped and not persisted: `/reload` or a new session restores the tool. `/benchmark --vision-tool` / `--vision-embedded` select the same tool for a benchmark run and record the resulting mode in the run's artifacts. Disabling the tool does not take away a model's native vision — a vision-capable model can still read image files directly
 
 ### Recommended benchmark setup
 
-Combine the tool with pi's built-in `images.blockImages` setting, which replaces every image in the transcript with an "Image reading is disabled." placeholder before the request is sent. With both enabled, request bodies stay small by construction, while the agent can still inspect any image on demand:
+`/benchmark` restricts the session to pi's built-in tools and the `headless-browser` skill by default; `--vision-tool` adds `analyze_image` to that set (see [benchmark](#benchmark)).
+
+Optionally combine the tool with pi's built-in `images.blockImages` setting, which replaces every image in the transcript with an "Image reading is disabled." placeholder before the request is sent. With both enabled, request bodies stay small by construction, while the agent can still inspect any image on demand:
 
 ```json
 {
@@ -431,7 +465,7 @@ Combine the tool with pi's built-in `images.blockImages` setting, which replaces
 }
 ```
 
-Set it in `.pi/settings.json` (project scope) so only benchmark workspaces are affected. The `/benchmark` task template already tells the agent to use `analyze_image` for visual checks.
+Set it in `.pi/settings.json` (project scope) so only benchmark workspaces are affected. Note that `blockImages` also blocks the model's own image input — use it when you want the model to see images *only* through `analyze_image`, and leave it off when a vision-capable model should be able to read screenshots natively. `/benchmark --vision-tool` already blocks native image input for its run, so `blockImages` is only needed to cover images that predate the run (or sessions that are not benchmarks).
 
 ### Usage examples
 

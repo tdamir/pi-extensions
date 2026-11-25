@@ -19,6 +19,23 @@
  * image from what is sent to the model (replaced by "Image reading is disabled."
  * placeholders). With both enabled, request bodies stay small by construction
  * while the agent can still inspect images on demand through this tool.
+ *
+ * Command:
+ * - `/vision` - show or change the `analyze_image` tool for the current session
+ *   (`/vision on|off|toggle|status`). The change is session-scoped and not persisted:
+ *   `/reload` or a new session restores the tool. Disable it when the agent should work
+ *   without any image-inspection path (e.g. text-only benchmark runs).
+ *
+ * Benchmark integration:
+ * - `/benchmark` restricts the session to pi's built-in tools and the
+ *   headless-browser skill by default. Its vision mode selects how the model
+ *   may inspect images: `embedded` (default - the model's own image modality,
+ *   e.g. reading a PNG with `read`) or `tool` (`--vision-tool` or
+ *   `--vision=tool`). `tool` adds this `analyze_image` tool and also blocks
+ *   native image input for the session (images from tools/input are replaced
+ *   by placeholders, history images are stripped), so the model can only see
+ *   images through this tool. The mode is recorded in the run's artifacts (see
+ *   ../benchmark/index.ts).
  */
 
 import { readFile } from "node:fs/promises";
@@ -309,6 +326,81 @@ export default function visionExtension(pi: ExtensionAPI) {
 				// Report the nested call's usage so session totals stay accurate.
 				usage: response.usage,
 			};
+		},
+	});
+
+	pi.registerCommand("vision", {
+		description:
+			"Show or change the analyze_image tool for this session (/vision [on|off|toggle|status]). Session-scoped; not persisted.",
+		getArgumentCompletions: (prefix) => {
+			const options = [
+				{ value: "on", label: "on", description: "Enable analyze_image for this session" },
+				{ value: "off", label: "off", description: "Disable analyze_image for this session" },
+				{ value: "toggle", label: "toggle", description: "Flip the analyze_image tool for this session" },
+				{ value: "status", label: "status", description: "Show whether analyze_image is enabled" },
+			];
+			const p = prefix.toLowerCase();
+			const matches = options.filter((o) => o.value.startsWith(p));
+			return matches.length > 0 ? matches : null;
+		},
+		handler: async (args, ctx) => {
+			const arg = args?.trim().toLowerCase() ?? "";
+
+			const setEnabled = (enabled: boolean) => {
+				const current = pi.getActiveTools();
+				const next = enabled
+					? current.includes("analyze_image")
+						? current
+						: [...current, "analyze_image"]
+					: current.filter((name) => name !== "analyze_image");
+				pi.setActiveTools(next);
+			};
+
+			if (!arg || arg === "status") {
+				const on = pi.getActiveTools().includes("analyze_image");
+				ctx.ui.notify(
+					on
+						? "analyze_image: on for this session. /vision off to disable it."
+						: "analyze_image: off for this session. /vision on to enable it.",
+					"info",
+				);
+				return;
+			}
+
+			const isOn = pi.getActiveTools().includes("analyze_image");
+
+			if (arg === "on" || arg === "enable" || arg === "show") {
+				if (isOn) {
+					ctx.ui.notify("analyze_image is already enabled for this session.", "info");
+					return;
+				}
+				setEnabled(true);
+				ctx.ui.notify("analyze_image enabled for this session.", "info");
+				return;
+			}
+
+			if (arg === "off" || arg === "disable" || arg === "hide") {
+				if (!isOn) {
+					ctx.ui.notify("analyze_image is already disabled for this session.", "info");
+					return;
+				}
+				setEnabled(false);
+				ctx.ui.notify("analyze_image disabled for this session. /vision on to re-enable it.", "info");
+				return;
+			}
+
+			if (arg === "toggle") {
+				setEnabled(!isOn);
+				ctx.ui.notify(
+					isOn
+						? "analyze_image disabled for this session. /vision on to re-enable it."
+						: "analyze_image enabled for this session.",
+					"info",
+				);
+				return;
+			}
+
+			ctx.ui.notify("Usage: /vision [on|off|toggle|status]", "error");
 		},
 	});
 }
