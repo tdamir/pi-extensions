@@ -54,6 +54,25 @@
  * working directory name (`-vision-embedded` / `-vision-tool`) and recorded in
  * task.md / summary.md / the run marker; it is shown in the footer and report.
  *
+ * Request-body guard: images are re-sent with every request, and pi's token
+ * accounting counts each image as ~1200 tokens regardless of its byte size, so
+ * the context-window based auto-compaction never reacts to image bytes. When
+ * the llama-swap engine serving the current model is TensorFold (32 MiB hard
+ * request-body limit, not configurable), the extension estimates the body size
+ * before each request and omits the oldest images from the request until it
+ * fits a 28 MiB budget. The transcript is untouched (images stay in the session
+ * file / report).
+ *
+ * The omitted set is sticky: a cutoff timestamp is remembered, so images stay
+ * omitted across requests and only the newest images are appended after it -
+ * the request prefix stays stable for the provider's prompt cache. The cutoff
+ * advances in batches (drop to a low watermark when the high watermark is
+ * crossed), so a cache-invalidating change happens once per batch of new
+ * images, not once per image. A rejected body (400/413) is detected too: the
+ * budget shrinks, the next request omits more images, and a benchmark run is
+ * retried once automatically. Omitted-image counts are recorded in summary.md
+ * and report.html.
+ *
  * Usage:
  *   /benchmark build a python CLI that converts csv to json
  *   /benchmark tasks/csv-to-cli.md
@@ -80,6 +99,17 @@ import {
 	plainPaint,
 } from "../llama-swap/stats";
 import { generateReport } from "./report";
+import {
+	BODY_GUARD_RETRY_BUDGET_BYTES,
+	BODY_LIMIT_ERROR_RE,
+	BODY_LIMIT_RECOVERY_PROMPT,
+	type BodyGuardState,
+	createBodyGuardState,
+	detectEngine,
+	pruneImagesForBudget,
+	resetBodyGuardState,
+	runEndedWithBodyLimitError,
+} from "./body-guard";
 
 const BENCHMARKS_DIR = "benchmarks";
 
@@ -92,6 +122,12 @@ interface PendingRun {
 	removedTools: string[];
 	nativeImagesBlocked: boolean;
 	startedAt: Date;
+	/** Unique images omitted from requests by the request-body guard during this run. */
+	prunedImages: number;
+	/** Batch prune steps (cutoff advances) during this run. */
+	pruneEvents: number;
+	/** Body-limit rejections recovered by retrying the run once. */
+	bodyLimitRecoveries: number;
 }
 
 /** Durable marker persisted into the session via pi.appendEntry(). */
@@ -113,6 +149,12 @@ interface BenchmarkRunData {
 	removedTools?: string[];
 	/** True when native image input was blocked so the model behaves like a text-only model (vision=tool). */
 	nativeImagesBlocked?: boolean;
+	/** Unique images the request-body guard omitted from requests during the run (they stay in the transcript). */
+	prunedImages?: number;
+	/** Batch prune steps (cutoff advances) during the run. */
+	pruneEvents?: number;
+	/** Body-limit rejections recovered by retrying the run once. */
+	bodyLimitRecoveries?: number;
 	summaryPath?: string;
 	reportPath?: string;
 	sessionCopyPath?: string;
@@ -152,6 +194,27 @@ let blockNativeImages = false;
 /** Text that replaces an image the session is not allowed to see. */
 const IMAGE_OMITTED =
 	"[image omitted - this session cannot view images directly. Use analyze_image with the file path to ask a question about it.]";
+
+// ---------------------------------------------------------------------------
+// Request-body guard (TensorFold rejects request bodies over 32 MiB)
+// ---------------------------------------------------------------------------
+
+/**
+ * TensorFold enforces a hard 32 MiB request-body limit (not configurable).
+ * Images are re-sent with every request and pi's token accounting counts each
+ * image as ~1200 tokens regardless of its byte size, so context-window based
+ * auto-compaction never reacts to them. The guard (./body-guard) works on bytes
+ * instead: before a request goes out it omits the oldest images from the
+ * request until the estimated body fits the budget. This is non-destructive -
+ * the session transcript (and the benchmark report) keeps every image. The
+ * omitted set is sticky (remembered cutoff), so the request prefix stays stable
+ * for the provider's prompt cache.
+ *
+ * The state below is session-scoped: `engine` is the engine that served the
+ * most recent request for the current model, and the guard only kicks in for
+ * tensorfold.
+ */
+const bodyGuard: BodyGuardState = createBodyGuardState();
 
 const VISION_TOOL_VALUES = new Set(["tool", "on", "true", "yes", "enabled", "enable", "analyze"]);
 const VISION_EMBEDDED_VALUES = new Set(["embedded", "off", "false", "no", "disabled", "disable", "native", "model", "builtin", "built-in"]);
@@ -346,10 +409,79 @@ export default function (pi: ExtensionAPI) {
 		return changed ? { messages } : undefined;
 	});
 
+	// Request-body guard: images are re-sent with every request and pi's token
+	// estimate counts each image as ~1200 tokens regardless of its byte size, so
+	// context-based auto-compaction never reacts to image bytes. TensorFold
+	// rejects request bodies over 32 MiB, so omit the oldest images from the
+	// request (never from the transcript) until the estimated body fits. The
+	// omitted set is sticky (remembered cutoff) so the request prefix stays
+	// stable for the provider's prompt cache; the cutoff only advances in
+	// batches when the body crosses the high watermark again.
+	pi.on("context", async (event, ctx) => {
+		if (blockNativeImages) return; // vision=tool runs already strip every image
+		if (!ctx.model?.input?.includes("image")) return; // images are not sent anyway
+		const detected = detectEngine(ctx.sessionManager.getEntries(), ctx.model?.id);
+		// Keep a previously forced engine when detection has nothing to go on
+		// (a body-limit rejection proves the limit even without usage records).
+		if (detected) bodyGuard.engine = detected;
+		if (bodyGuard.engine !== "tensorfold") return;
+
+		const pruned = pruneImagesForBudget(event.messages, bodyGuard.budgetBytes, bodyGuard.pruneBeforeMs);
+		if (!pruned) return;
+
+		// Remember the cutoff so the same images stay omitted on later requests.
+		bodyGuard.pruneBeforeMs = pruned.pruneBeforeMs;
+		if (pruned.newlyDropped > 0) {
+			bodyGuard.prunedImages += pruned.newlyDropped;
+			bodyGuard.pruneEvents += 1;
+			if (pendingRun) {
+				pendingRun.prunedImages += pruned.newlyDropped;
+				pendingRun.pruneEvents += 1;
+			}
+			if (!bodyGuard.notified) {
+				bodyGuard.notified = true;
+				ctx.ui.notify(
+					`TensorFold request-body guard: ${pruned.dropped} older image(s) omitted from requests to stay under the 32 MiB limit (they remain in the transcript; the omitted set stays fixed until the body grows again).`,
+					"warning",
+				);
+			}
+		}
+		return { messages: pruned.messages };
+	});
+
+	// A body-limit rejection (TensorFold returns 400, pi does not retry it) ends
+	// the run. Shrink the budget so the next request's cutoff advance omits
+	// enough images to fit, and let agent_settled retry a benchmark run once
+	// (see below).
+	pi.on("message_end", async (event) => {
+		const message = event.message;
+		if (message.role !== "assistant" || message.stopReason !== "error") return;
+		if (!message.errorMessage || !BODY_LIMIT_ERROR_RE.test(message.errorMessage)) return;
+		// The rejection proves this engine enforces the limit, even when the
+		// usage records do not reveal the engine yet. Shrink the budget; the
+		// next request's cutoff advance omits enough images to fit it.
+		bodyGuard.engine = "tensorfold";
+		bodyGuard.budgetBytes = Math.min(bodyGuard.budgetBytes, BODY_GUARD_RETRY_BUDGET_BYTES);
+	});
+
+	// A 413 is also a body-limit rejection (some gateways use it instead of 400).
+	pi.on("after_provider_response", async (event) => {
+		if (event.status !== 413) return;
+		bodyGuard.engine = "tensorfold";
+		bodyGuard.budgetBytes = Math.min(bodyGuard.budgetBytes, BODY_GUARD_RETRY_BUDGET_BYTES);
+	});
+
+	// A different model may be served by a different engine; re-detect on the
+	// next request instead of keeping the previous model's engine.
+	pi.on("model_select", async () => {
+		bodyGuard.engine = undefined;
+	});
+
 	// Restore the footer marker (and the skill/image restrictions) when a
 	// benchmark session is resumed/reloaded. The tool loadout itself is restored
 	// by pi from the session transcript.
 	pi.on("session_start", async (_event, ctx) => {
+		resetBodyGuardState(bodyGuard);
 		let last: BenchmarkRunData | undefined;
 		for (const entry of ctx.sessionManager.getEntries()) {
 			if (entry.type === "custom" && entry.customType === RUN_ENTRY_TYPE) {
@@ -366,6 +498,22 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", async (event, ctx) => {
 		const run = pendingRun;
 		if (!run) return;
+
+		// TensorFold's 32 MiB body limit surfaces as a 400, which pi does not
+		// retry. The guard already shrank the budget, so retry the benchmark run
+		// once with more images omitted from the request.
+		if (!event.aborted && run.bodyLimitRecoveries === 0 && runEndedWithBodyLimitError(ctx, run.startedAt)) {
+			run.bodyLimitRecoveries += 1;
+			bodyGuard.engine = "tensorfold";
+			bodyGuard.budgetBytes = Math.min(bodyGuard.budgetBytes, BODY_GUARD_RETRY_BUDGET_BYTES);
+			ctx.ui.notify(
+				"TensorFold rejected the request body as too large. Images were dropped from the request and the run is retried once.",
+				"warning",
+			);
+			pi.sendUserMessage(BODY_LIMIT_RECOVERY_PROMPT);
+			return;
+		}
+
 		pendingRun = null;
 
 		try {
@@ -411,6 +559,13 @@ export default function (pi: ExtensionAPI) {
 				`- **Ended:** ${endedAt.toISOString()}`,
 				`- **Duration:** ${formatDuration(endedAt.getTime() - run.startedAt.getTime())}`,
 				`- **Outcome:** ${outcome}`,
+				...(run.prunedImages > 0
+					? [
+							`- **Request-body guard:** ${run.prunedImages} image(s) omitted from requests in ${run.pruneEvents} prune step(s) to stay under TensorFold's 32 MiB limit${
+								run.bodyLimitRecoveries > 0 ? ` (${run.bodyLimitRecoveries} retry after a rejected body)` : ""
+							}`,
+						]
+					: []),
 				`- **Working directory:** ${run.workDir}`,
 				"",
 				"## Stats",
@@ -441,6 +596,9 @@ export default function (pi: ExtensionAPI) {
 				profile: run.profile,
 				removedTools: run.removedTools,
 				nativeImagesBlocked: run.nativeImagesBlocked,
+				prunedImages: run.prunedImages,
+				pruneEvents: run.pruneEvents,
+				bodyLimitRecoveries: run.bodyLimitRecoveries,
 				startedAt: run.startedAt.toISOString(),
 				endedAt: endedAt.toISOString(),
 				durationMs: endedAt.getTime() - run.startedAt.getTime(),
@@ -805,7 +963,18 @@ ${requirement}
 			}
 
 			// pi.sendUserMessage always triggers a turn; deliverAs queues it if the agent is busy
-			pendingRun = { workDir, modelLabel, vision, profile: parsed.profile, removedTools, nativeImagesBlocked: blockNativeImages, startedAt: now };
+			pendingRun = {
+				workDir,
+				modelLabel,
+				vision,
+				profile: parsed.profile,
+				removedTools,
+				nativeImagesBlocked: blockNativeImages,
+				startedAt: now,
+				prunedImages: 0,
+				pruneEvents: 0,
+				bodyLimitRecoveries: 0,
+			};
 			pi.sendUserMessage(taskContent);
 		},
 	});

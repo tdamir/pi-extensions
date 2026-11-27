@@ -355,6 +355,16 @@ The mode is resolved before anything is recorded and persisted everywhere: the w
 
 Selecting `tool` requires the vision extension to be loaded (the `analyze_image` tool registered); otherwise the command refuses to start. The toolset change and the native-image block are session-scoped, exactly like `/vision on|off`, so they stay in effect after the run (and are restored when a benchmark session is resumed); a later `--vision-embedded` run or `/reload` restores native image input. A `--all` run only blocks native images when `tool` was requested explicitly — without a flag it leaves the session's own behavior alone.
 
+### Request-body guard (TensorFold 32 MiB limit)
+
+Images are re-sent with every request, and pi counts each image as ~1200 tokens regardless of its byte size, so the context-window based auto-compaction never reacts to image bytes. TensorFold rejects request bodies over 32 MiB (`request body exceeds the 32 MiB limit`), which an image-heavy `--vision-embedded` run can hit mid-task.
+
+The extension reads the llama-swap usage records to learn which engine serves the current model. When that engine is TensorFold, it estimates the request body size before every request (base64 image bytes dominate) and omits the **oldest images** from the request until the body fits a 28 MiB budget (4 MiB headroom for the prompt, tool declarations and JSON overhead). This is non-destructive: the session transcript, `session-*.jsonl` and `report.html` keep every image — only the outgoing request is trimmed. Each omitted image is replaced by a short placeholder telling the model to re-read the file if it needs it.
+
+The omitted set is **sticky**, which keeps the provider's prompt cache useful. A cutoff timestamp is remembered and every image at or before it stays omitted on later requests; new images are only appended after the cutoff, so the request prefix does not change between requests. The cutoff advances in batches (hysteresis): when the body crosses the 28 MiB high watermark it is dropped to about half the budget (the low watermark), then left alone until new images grow it past 28 MiB again. A cache-invalidating change therefore happens once per batch of new images instead of once per image.
+
+If a request is still rejected (`400 … request body exceeds`, or `413`), the budget shrinks to 12 MiB and the next request advances the cutoff further (down to ~6 MiB), so the retry fits with a wide margin; the session keeps the smaller budget. A benchmark run is also retried once automatically after such a rejection (the model is asked to continue from where it left off). The number of omitted images and prune steps is recorded in `summary.md` (a `Request-body guard` line) and as a **Request body guard** card in `report.html`. The guard also applies outside benchmark runs whenever the selected model is served by TensorFold; the user is notified once per session when pruning first happens.
+
 To benchmark several models, select each model (`Ctrl+P` / `/model`) and run `/benchmark` with the same requirement — then compare the `final/` folders of the per-model directories.
 
 When the task finishes (the agent run ends), the extension writes `summary.md` into the run's directory: model, vision mode (embedded/tool), tools/skills profile, start/end timestamps, wall-clock duration, outcome (`completed` / `aborted` / `error`), the same llama-swap stats the `/swap-stats` command shows (including the tool-calls and skills sections), and a pi-style session section (message counts, input/cached/uncached/output/total tokens, final context usage, cost). Everything except the session identity (name/file/id) is scoped to that run only, so multiple benchmark runs can share one session without polluting each other's summaries.
@@ -453,7 +463,7 @@ Answers questions about image files with a vision model while keeping the image 
 
 Every image that reaches the session (a screenshot tool result, `read` on a PNG, a browser automation capture) is embedded in the transcript and re-sent with every subsequent request. In long sessions — benchmarks that verify rendered pages, browser-driven testing — request bodies can grow past engine limits (TensorFold rejects bodies over 32 MB, and the limit is not configurable).
 
-`analyze_image` breaks that coupling: the model passes a file path and a question, the tool runs a **separate, one-off model call** with the image, and only the text answer enters the conversation. The image never touches the transcript.
+`analyze_image` breaks that coupling: the model passes a file path and a question, the tool runs a **separate, one-off model call** with the image, and only the text answer enters the conversation. The image never touches the transcript. For models that must use their own image modality, the benchmark extension's [request-body guard](#request-body-guard-tensorfold-32-mib-limit) trims the oldest images from the outgoing request automatically when TensorFold is the engine.
 
 ### Features
 

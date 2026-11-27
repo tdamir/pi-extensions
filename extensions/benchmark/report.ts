@@ -38,6 +38,12 @@ interface BenchmarkRunData {
 	vision?: "embedded" | "tool";
 	/** True when native image input was blocked (vision=tool runs behave like text-only sessions). */
 	nativeImagesBlocked?: boolean;
+	/** Images the request-body guard dropped from requests during the run (they stay in the transcript). */
+	prunedImages?: number;
+	/** Requests that had images dropped by the guard. */
+	pruneEvents?: number;
+	/** Body-limit rejections recovered by retrying the run once. */
+	bodyLimitRecoveries?: number;
 	/** Tool/skill profile of the run: restricted (built-in tools + headless-browser skill) or all. */
 	profile?: "restricted" | "all";
 	summaryPath?: string;
@@ -214,6 +220,17 @@ function dashboardHtml(
 				"Tools/skills",
 				run.profile,
 				run.profile === "restricted" ? "pi built-ins + headless-browser skill" : "session tools and skills",
+			),
+		);
+	}
+	if (run?.prunedImages) {
+		cards.push(
+			card(
+				"Request body guard",
+				fmtInt(run.prunedImages),
+				`image(s) omitted in ${fmtInt(run.pruneEvents ?? 0)} prune step(s)` +
+					(run.bodyLimitRecoveries ? ` · ${fmtInt(run.bodyLimitRecoveries)} retry after a rejected body` : ""),
+				"warn",
 			),
 		);
 	}
